@@ -1,6 +1,5 @@
 """
 
-
 """
 from __future__ import annotations
 
@@ -14,11 +13,9 @@ import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import LabelEncoder
 from sklearn.tree import DecisionTreeClassifier
+from pandas.api.types import is_integer_dtype
 
-try:
-    from xgboost import XGBClassifier
-except Exception:
-    XGBClassifier = None
+from xgboost import XGBClassifier
 
 @dataclass
 class ModelConfig:
@@ -32,6 +29,19 @@ class ModelConfig:
     use_inverse_freq_weights: bool = True
     use_oss: bool = True
     oss_max_ratio: float = 10.0
+    # If set, selects the majority class among labels matching this regex (e.g., r"^(tau|silent)$").
+    # If no label matches, falls back to the most frequent class.
+    oss_majority_label_regex: Optional[str] = None
+    # Further downsample majority rows that contain only "empty" information.
+    # (In this project, those are typically rows where all feature columns are missing/NaN.)
+    # Value is the fraction of the normal majority cap to keep for empty rows.
+    oss_majority_empty_frac: float = 0.1
+    # Force specific feature columns to be treated as categorical (one-hot) even if they are ints.
+    # Example: r"(^VariantIndex$|^VariantIndex_prev[123]$)".
+    categorical_col_regex: Optional[str] = None
+    # If True, treat integer-coded columns as categorical (one-hot) by default.
+    # Floats are treated as continuous numeric attributes.
+    treat_int_as_categorical: bool = True
     calibrate: bool = True
     calibration_method: str = "sigmoid"
     calibration_cv: int = 5
@@ -93,107 +103,64 @@ def _priors_from_ints(y_int: np.ndarray) -> Dict[int, float]:
     s = float(counts.sum()) if counts.size else 1.0
     return {i: float(counts[i]) / s for i in range(counts.size)}
 
-def _oss_indices(y_int: np.ndarray, max_ratio: float, random_state: int) -> np.ndarray:
+def _oss_indices(y_int: np.ndarray,
+                 max_ratio: float,
+                 random_state: int,
+                 *,
+                 majority_class: Optional[int] = None,
+                 empty_mask: Optional[np.ndarray] = None,
+                 majority_empty_frac: float = 0.1) -> np.ndarray:
+    
     rng = np.random.default_rng(int(random_state))
     counts = np.bincount(y_int)
-    nonzero = counts[counts > 0]
-    if nonzero.size == 0:
+    present = np.flatnonzero(counts)
+    if present.size == 0:
         return np.arange(len(y_int))
-    min_count = int(nonzero.min())
-    cap = int(max(1, min_count * float(max_ratio)))
 
-    keep_indices: List[int] = []
-    for cls, cnt in enumerate(counts):
-        if cnt == 0:
-            continue
+    if majority_class is None:
+        majority_class = int(present[np.argmax(counts[present])])
+
+    other_counts = counts[(counts > 0) & (np.arange(len(counts)) != int(majority_class))]
+    if other_counts.size == 0:
+        return np.arange(len(y_int))
+
+    ref = int(np.median(other_counts))
+    cap = int(max(1, ref * float(max_ratio)))
+    cap_empty = int(max(1, round(cap * float(majority_empty_frac))))
+
+    keep: List[int] = []
+    empty_mask_arr = None
+    if empty_mask is not None:
+        empty_mask_arr = np.asarray(empty_mask, dtype=bool)
+        if empty_mask_arr.shape[0] != y_int.shape[0]:
+            empty_mask_arr = None
+
+    for cls in present.tolist():
+        cls = int(cls)
         cls_idx = np.where(y_int == cls)[0]
-        if cnt > cap:
-            cls_idx = rng.choice(cls_idx, size=cap, replace=False)
-        keep_indices.extend(cls_idx.tolist())
-
-    return np.asarray(keep_indices, dtype=int)
-
-def extract_tree_guards_probabilistic(
-    clf: DecisionTreeClassifier,
-    feature_names: List[str],
-    class_int_to_label: Dict[int, str],
-    priors: Dict[int, float],
-    min_leaf_prob: float = 0.2,
-    min_leaf_lift: float = 2.0,
-    min_leaf_support: int = 20,
-    always_keep_best: bool = True,
-) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Returns per-label a list of rules with:
-      - rule (string)
-      - prob (leaf probability for that class, Laplace-smoothed)
-      - support (number of samples in the leaf)
-      - lift (prob / prior)
-    """
-    tree = clf.tree_
-    feature_undef = -2
-
-    def cond_str(feat_idx: int, thresh: float, direction: str) -> str:
-        fname = feature_names[feat_idx]
-        return f"({fname} <= {thresh:.6g})" if direction == "left" else f"({fname} > {thresh:.6g})"
-
-    # classes in the tree are ints (LabelEncoder ints)
-    class_ints = [int(c) for c in clf.classes_]
-    labels = [class_int_to_label[i] for i in class_ints]
-
-    rules_by_label: Dict[str, List[Dict[str, Any]]] = {lab: [] for lab in labels}
-    best_by_label: Dict[str, Dict[str, Any]] = {lab: {"prob": -1.0, "support": 0, "rule": "(false)", "lift": 0.0} for lab in labels}
-
-    stack: List[Tuple[int, List[str]]] = [(0, [])]
-    while stack:
-        node_id, path_conds = stack.pop()
-        feat_idx = int(tree.feature[node_id])
-
-        if feat_idx == feature_undef:
-            # IMPORTANT: use true sample count, not weighted value sum
-            support = int(tree.n_node_samples[node_id])
-            if support < int(min_leaf_support):
-                continue
-
-            counts = tree.value[node_id][0].astype(float)
-            # Laplace smoothing (helps with rare classes)
-            probs = (counts + 1.0) / (counts.sum() + float(len(counts)))
-
-            rule_str = " AND ".join(path_conds) if path_conds else "(true)"
-
-            for j, c_int in enumerate(class_ints):
-                lab = class_int_to_label[int(c_int)]
-                p = float(probs[j])
-                prior = float(priors.get(int(c_int), 1e-12))
-                lift = p / max(prior, 1e-12)
-
-                # track best leaf per label (for fallback)
-                if p > float(best_by_label[lab]["prob"]):
-                    best_by_label[lab] = {"prob": p, "support": support, "rule": rule_str, "lift": lift}
-
-                # selection: absolute prob OR lift-over-prior
-                if (p >= float(min_leaf_prob)) or (lift >= float(min_leaf_lift)):
-                    rules_by_label[lab].append(
-                        {"rule": rule_str, "prob": p, "support": support, "lift": lift}
-                    )
+        if cls != int(majority_class):
+            keep.extend(cls_idx.tolist())
             continue
 
-        thresh = float(tree.threshold[node_id])
-        left_id = int(tree.children_left[node_id])
-        right_id = int(tree.children_right[node_id])
+        # Majority: downsample, and downsample "empty" rows even harder.
+        maj_idx = cls_idx
+        if empty_mask_arr is not None:
+            maj_empty = maj_idx[empty_mask_arr[maj_idx]]
+            maj_nonempty = maj_idx[~empty_mask_arr[maj_idx]]
+        else:
+            maj_empty = np.asarray([], dtype=int)
+            maj_nonempty = maj_idx
 
-        stack.append((right_id, path_conds + [cond_str(feat_idx, thresh, "right")]))
-        stack.append((left_id, path_conds + [cond_str(feat_idx, thresh, "left")]))
+        if maj_nonempty.size > cap:
+            maj_nonempty = rng.choice(maj_nonempty, size=cap, replace=False)
+        if maj_empty.size > cap_empty:
+            maj_empty = rng.choice(maj_empty, size=cap_empty, replace=False)
 
-    # fallback: ensure at least one rule per label (if possible)
-    if always_keep_best:
-        for lab in labels:
-            if not rules_by_label[lab]:
-                best = best_by_label[lab]
-                if best["prob"] > 0 and best["support"] >= int(min_leaf_support):
-                    rules_by_label[lab] = [best]
+        keep.extend(maj_nonempty.tolist())
+        keep.extend(maj_empty.tolist())
 
-    return rules_by_label
+    return np.asarray(keep, dtype=int)
+
 
 class FunctionEstimator:
     def __init__(self, model_cfg: Optional[ModelConfig] = None) -> None:
@@ -220,13 +187,14 @@ class FunctionEstimator:
                     model_cfg: Optional[ModelConfig] = None) -> "FunctionEstimator":
         # decision mining custom fremwork: ModelConfig(model_type='sklearn_tree', random_state=7, max_depth=5, min_samples_leaf=20, n_estimators=300, learning_rate=0.05, use_inverse_freq_weights=True, use_oss=True, oss_max_ratio=10.0, calibrate=True, calibration_method='sigmoid')
         est = cls(model_cfg=model_cfg)
+        # X: I, y: chosen, feature_cols: attributes
         est.fit(X_raw, y, feature_cols=feature_cols)
         return est
 
     def fit(self,
             X_raw: pd.DataFrame, y: List[str],
             feature_cols: Optional[List[str]] = None) -> "FunctionEstimator":
-        # X from the miner: X_raw
+        
         X_work = X_raw.copy()
         if feature_cols:
             for c in feature_cols:
@@ -234,20 +202,85 @@ class FunctionEstimator:
                     X_work[c] = np.nan
             X_work = X_work[feature_cols]
 
+        # Treat int-coded IDs as categorical by default (one-hot), while keeping floats continuous.
+        if bool(getattr(self.model_cfg, "treat_int_as_categorical", True)):
+            try:
+                for col in list(X_work.columns):
+                    s = X_work[col]
+                    if is_integer_dtype(s.dtype):
+                        X_work[col] = s.astype("string")
+                        continue
+            except Exception:
+                pass
+
+        # Force some int-coded IDs to categorical so trees don't learn meaningless numeric thresholds.
+        pat = getattr(self.model_cfg, "categorical_col_regex", None)
+        if pat:
+            try:
+                rx = re.compile(str(pat))
+                for col in list(X_work.columns):
+                    if rx.search(str(col)):
+                        # Convert to pandas string dtype; keep missing values as <NA>.
+                        try:
+                            X_work[col] = X_work[col].astype("string")
+                        except Exception:
+                            X_work[col] = X_work[col].map(
+                                lambda v: (pd.NA if v is None or (isinstance(v, float) and np.isnan(v)) else str(v))
+                            ).astype("string")
+            except Exception:
+                # If regex is invalid or conversion fails, fall back silently.
+                pass
+
+        # Identify rows that are effectively "empty" (common for silent transitions):
+        # no informative feature values beyond structural indicators.
+        empty_mask: Optional[np.ndarray] = None
+        try:
+            X_other = X_work.drop(columns=["past_events_count"], errors="ignore")
+            empty_mask = X_other.isna().all(axis=1).to_numpy(dtype=bool)
+        except Exception:
+            empty_mask = None
+
         X_enc_full, encoder = fit_feature_encoder(X_work, prefix_sep="=")
 
         le = LabelEncoder()
         y_int_full = le.fit_transform(np.asarray(y, dtype=str))
+        # class index (key) to (label)
         class_int_to_label = {int(i): str(lbl) for i, lbl in enumerate(le.classes_)}
 
         self._priors = _priors_from_ints(y_int_full)
 
         X_enc_train = X_enc_full
         y_int_train = y_int_full
-        if self.model_cfg.use_oss and self.model_cfg.oss_max_ratio > 1.0:
-            keep_idx = _oss_indices(y_int_full, self.model_cfg.oss_max_ratio, self.model_cfg.random_state)
-            X_enc_train = X_enc_full.iloc[keep_idx]
-            y_int_train = y_int_full[keep_idx]
+        
+        if self.model_cfg.use_oss:
+            # Prefer a configured "silent" label pattern if provided, else the most frequent class.
+            majority_cls: Optional[int] = None
+            try:
+                counts = np.bincount(y_int_full)
+                present = np.flatnonzero(counts)
+                if present.size:
+                    pat = getattr(self.model_cfg, "oss_majority_label_regex", None)
+                    if pat:
+                        rx = re.compile(str(pat))
+                        matching = [c for c in present if rx.search(class_int_to_label.get(int(c), ""))]
+                        if matching:
+                            majority_cls = int(max(matching, key=lambda c: int(counts[int(c)])))
+                    if majority_cls is None:
+                        majority_cls = int(present[np.argmax(counts[present])])
+            except Exception:
+                majority_cls = None
+
+            if float(self.model_cfg.oss_max_ratio) >= 1.0:
+                keep_idx = _oss_indices(
+                    y_int_full,
+                    self.model_cfg.oss_max_ratio,
+                    self.model_cfg.random_state,
+                    majority_class=majority_cls,
+                    empty_mask=empty_mask,
+                    majority_empty_frac=float(getattr(self.model_cfg, "oss_majority_empty_frac", 0.1)),
+                )
+                X_enc_train = X_enc_full.iloc[keep_idx]
+                y_int_train = y_int_full[keep_idx]
 
         sample_weight = None
         if self.model_cfg.use_inverse_freq_weights and self.model_cfg.model_type != "sklearn_tree":
@@ -328,15 +361,13 @@ class FunctionEstimator:
         labels = [self.class_int_to_label[int(c)] for c in class_ints]
         return labels, np.asarray(proba, dtype=float)
 
-    def extract_probabilistic_guards_simple(
-        self,
-        min_leaf_prob: float = 0.2,
-        min_leaf_lift: float = 2.0,
-        min_leaf_support: int = 20,
-        surrogate_max_depth: int = 4,
-        surrogate_min_leaf: int = 20,
-        always_keep_best: bool = True,
-    ) -> Dict[str, List[Dict[str, Any]]]:
+    def extract_probabilistic_guards_simple(self,
+                                            min_leaf_prob: float = 0.2,
+                                            min_leaf_lift: float = 2.0,
+                                            min_leaf_support: int = 20,
+                                            surrogate_max_depth: int = 4,
+                                            surrogate_min_leaf: int = 20,
+                                            always_keep_best: bool = True) -> Dict[str, List[Dict[str, Any]]]:
         
         if self.encoder is None or self.clf is None:
             raise RuntimeError("Estimator is not fitted.")
@@ -357,16 +388,14 @@ class FunctionEstimator:
             tree.fit(self._train_X_enc, self._train_y_hat)
             priors = _priors_from_ints(self._train_y_hat)
 
-        rules_by_label = extract_tree_guards_probabilistic(
-            tree,
-            feature_names=self.feature_names,
-            class_int_to_label=self.class_int_to_label,
-            priors=priors,
-            min_leaf_prob=min_leaf_prob,
-            min_leaf_lift=min_leaf_lift,
-            min_leaf_support=min_leaf_support,
-            always_keep_best=always_keep_best,
-        )
+        rules_by_label = extract_tree_guards_probabilistic(tree,
+                                                           feature_names=self.feature_names,
+                                                           class_int_to_label=self.class_int_to_label,
+                                                           priors=priors,
+                                                           min_leaf_prob=min_leaf_prob,
+                                                           min_leaf_lift=min_leaf_lift,
+                                                           min_leaf_support=min_leaf_support,
+                                                           always_keep_best=always_keep_best)
 
         # parse conditions
         cond_re = re.compile(
@@ -397,23 +426,23 @@ class FunctionEstimator:
                         # one-hot feature uses "=" separator, e.g., Resource_prefix_mode=Value 8
                         if "=" in feat:
                             base, value = feat.split("=", 1)
+
+                            # Drop missingness dummies (dummy_na=True) from guard output.
+                            # They tend to generate low-quality / non-actionable guards.
+                            v_norm = str(value).strip().lower()
+                            if v_norm in {"nan", "<na>", "none", "null"}:
+                                continue
+
                             entry = categorical_sets.setdefault(base, {"include": [], "exclude": []})
 
-                            # typical one-hot split is around 0.5
-                            if op == ">" and thresh >= 0.5:
+                            # For one-hot/binary dummy features, the operator alone is sufficient:
+                            #   (feat > t) means value is present, (feat <= t) means value is absent.
+                            if op == ">":
                                 if value not in entry["include"]:
                                     entry["include"].append(value)
-                                continue
-                            if op == "<=" and thresh < 0.5:
+                            else:
                                 if value not in entry["exclude"]:
                                     entry["exclude"].append(value)
-                                continue
-                            # if threshold is weird, just treat it numerically
-                            interval = intervals.setdefault(feat, {"low": None, "high": None})
-                            if op == ">":
-                                interval["low"] = thresh if interval["low"] is None else max(interval["low"], thresh)
-                            else:
-                                interval["high"] = thresh if interval["high"] is None else min(interval["high"], thresh)
                             continue
 
                         # numeric feature interval
@@ -430,10 +459,120 @@ class FunctionEstimator:
                         "prob": rule_prob,
                         "support": rule_support,
                         "lift": rule_lift,
-                        "rule": rule,
+                        "raw_rule": rule,
+                        "rule": _simplify_guard_rule(intervals, categorical_sets),
                     }
                 )
 
             guards[label] = label_guards
 
         return guards
+
+
+def _simplify_guard_rule(
+    intervals: Dict[str, Dict[str, Optional[float]]],
+    categorical_sets: Dict[str, Dict[str, List[Any]]],
+) -> str:
+    parts: List[str] = []
+
+    # Categorical constraints (set-based)
+    for base in sorted(categorical_sets.keys()):
+        entry = categorical_sets[base] or {}
+        inc = [str(v) for v in entry.get("include", []) if v is not None]
+        exc = [str(v) for v in entry.get("exclude", []) if v is not None]
+        if inc:
+            parts.append(f"({base} in {{{', '.join(sorted(set(inc)))}}})")
+        if exc:
+            parts.append(f"({base} not in {{{', '.join(sorted(set(exc)))}}})")
+
+    # Numeric intervals
+    for feat in sorted(intervals.keys()):
+        iv = intervals[feat] or {}
+        low = iv.get("low")
+        high = iv.get("high")
+        if low is not None:
+            parts.append(f"({feat} > {low:.6g})")
+        if high is not None:
+            parts.append(f"({feat} <= {high:.6g})")
+
+    return " AND ".join(parts) if parts else "(true)"
+
+def extract_tree_guards_probabilistic(clf: DecisionTreeClassifier,
+                                      feature_names: List[str],
+                                      class_int_to_label: Dict[int, str],
+                                      priors: Dict[int, float],
+                                      min_leaf_prob: float = 0.2,
+                                      min_leaf_lift: float = 2.0,
+                                      min_leaf_support: int = 20,
+                                      always_keep_best: bool = True) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Returns per-label a list of rules with:
+      - rule (string)
+      - prob (leaf probability for that class, Laplace-smoothed)
+      - support (number of samples in the leaf)
+      - lift (prob / prior)
+    """
+    tree = clf.tree_
+    feature_undef = -2
+
+    def cond_str(feat_idx: int, thresh: float, direction: str) -> str:
+        fname = feature_names[feat_idx]
+        return f"({fname} <= {thresh:.6g})" if direction == "left" else f"({fname} > {thresh:.6g})"
+
+    # classes in the tree are ints (LabelEncoder ints)
+    class_ints = [int(c) for c in clf.classes_]
+    labels = [class_int_to_label[i] for i in class_ints]
+
+    rules_by_label: Dict[str, List[Dict[str, Any]]] = {lab: [] for lab in labels}
+    best_by_label: Dict[str, Dict[str, Any]] = {lab: {"prob": -1.0, "support": 0, "rule": "(false)", "lift": 0.0} for lab in labels}
+
+    stack: List[Tuple[int, List[str]]] = [(0, [])]
+    while stack:
+        node_id, path_conds = stack.pop()
+        feat_idx = int(tree.feature[node_id])
+
+        if feat_idx == feature_undef:
+            # IMPORTANT: use true sample count, not weighted value sum
+            support = int(tree.n_node_samples[node_id])
+            if support < int(min_leaf_support):
+                continue
+
+            counts = tree.value[node_id][0].astype(float)
+            # Laplace smoothing (helps with rare classes)
+            probs = (counts + 1.0) / (counts.sum() + float(len(counts)))
+
+            rule_str = " AND ".join(path_conds) if path_conds else "(true)"
+
+            for j, c_int in enumerate(class_ints):
+                lab = class_int_to_label[int(c_int)]
+                p = float(probs[j])
+                prior = float(priors.get(int(c_int), 1e-12))
+                lift = p / max(prior, 1e-12)
+
+                # track best leaf per label (for fallback)
+                if p > float(best_by_label[lab]["prob"]):
+                    best_by_label[lab] = {"prob": p, "support": support, "rule": rule_str, "lift": lift}
+
+                # selection: absolute prob OR lift-over-prior
+                if (p >= float(min_leaf_prob)) or (lift >= float(min_leaf_lift)):
+                    rules_by_label[lab].append(
+                        {"rule": rule_str, "prob": p, "support": support, "lift": lift}
+                    )
+            continue
+
+        thresh = float(tree.threshold[node_id])
+        left_id = int(tree.children_left[node_id])
+        right_id = int(tree.children_right[node_id])
+
+        stack.append((right_id, path_conds + [cond_str(feat_idx, thresh, "right")]))
+        stack.append((left_id, path_conds + [cond_str(feat_idx, thresh, "left")]))
+
+    # fallback: ensure at least one rule per label (if possible)
+    if always_keep_best:
+        for lab in labels:
+            if not rules_by_label[lab]:
+                best = best_by_label[lab]
+                if best["prob"] > 0 and best["support"] >= int(min_leaf_support):
+                    rules_by_label[lab] = [best]
+
+    return rules_by_label
