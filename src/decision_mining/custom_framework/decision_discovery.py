@@ -4,6 +4,7 @@ Based on algorithm from:
 - De Leoni, and Van Der Aalst. "Data-aware process mining: discovering decisions in processes using alignments." ACM symposium on applied computing. 2013.
 
 - Adaptions:
+Use also historical events as input for decision mining
 
 """
 from __future__ import annotations
@@ -12,15 +13,21 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
 
+import re
 import numpy as np
 import pandas as pd
+from pm4py.visualization.petri_net import visualizer as pn_vis
 
-from decision_mining.custom_framework.function_estimator import FunctionEstimator, ModelConfig
+from decision_mining.custom_framework.function_estimator_DT_basic import FunctionEstimator as fe_basic
+from decision_mining.custom_framework.function_estimator_catboost_advanced import FunctionEstimator as fe_advanced
+
+from decision_mining.custom_framework.function_estimator_DT_basic import ModelConfig as mc_basic
+from decision_mining.custom_framework.function_estimator_catboost_advanced import ModelConfig as mc_advanced
 
 @dataclass
 class DecisionPointModel:
     place_name: str
-    estimator: FunctionEstimator
+    estimator: Any
 
 
 @dataclass
@@ -42,7 +49,7 @@ class DecisionDiscovery:
         
         # create case elapsed time
         self.__create_case_elapsed_time_column()
-        # create event elapsed time
+        # create event elapsed time: Ensure the same time processing as for the data preparation
         self.__create_event_elapsed_time_column()
         
         self.alignments = alignments
@@ -52,13 +59,18 @@ class DecisionDiscovery:
 
         # decision places (>1 outgoing)
         self.decision_places: List[Any] = [p for p in self.net.places if len(p.out_arcs) > 1]
+        
+        # dict: key: decision place, value: list of outgoing transitions from this place
         self.routing_transitions_by_place: Dict[Any, List[Any]] = {p: [arc.target for arc in p.out_arcs] for p in self.decision_places}
 
+        # vice versa: dict: key: transition, value: list of places before
         self.in_place_for_routing_transition: Dict[Any, List[Any]] = defaultdict(list)
         for place, transitions in self.routing_transitions_by_place.items():
             for transition in transitions:
                 self.in_place_for_routing_transition[transition].append(place)
                 
+        print('discovery initialization completed!')
+        
     def __create_case_elapsed_time_column(self) -> None:
         """
         Create a new column representing elapsed time since the case start.
@@ -75,6 +87,7 @@ class DecisionDiscovery:
     def __create_event_elapsed_time_column(self) -> None:
         """
         Create a new column representing elapsed time since the previous event.
+        - start with 0.0 instead of NaN as in the original encoding
         """
         case_col = "case:concept:name"
         ts_col = "time:timestamp"
@@ -92,7 +105,7 @@ class DecisionDiscovery:
         else:
             filtered = attrs
 
-        # Convention: ints are IDs/categorical; floats are continuous.
+        # ints are IDs/categorical; floats are continuous.
         out: Dict[str, Any] = {}
         for k, v in filtered.items():
             if isinstance(v, (int, np.integer)):
@@ -102,7 +115,6 @@ class DecisionDiscovery:
         return out
 
     def collect_I(self,
-                  attributes: Optional[List[str]] = None,
                   dynamic_attributes: Optional[List[str]] = None,
                   static_attributes: Optional[List[str]] = None) -> Tuple[Dict[Any, List[Tuple[Dict[str, Any], Any]]], Dict[Any, List[Any]]]:
         """
@@ -117,15 +129,8 @@ class DecisionDiscovery:
         I: Dict[Any, List[Tuple[Dict[str, Any], Any]]] = defaultdict(list)
         legend = defaultdict(list)
         
-        # Determine which attributes are used for:
-        # - current event features (dynamic + static)
-        # - past_events (dynamic only)
-        if dynamic_attributes is None and static_attributes is None:
-            current_attr_keys = attributes
-            past_attr_keys = attributes
-        else:
-            current_attr_keys = (dynamic_attributes or []) + (static_attributes or [])
-            past_attr_keys = dynamic_attributes or []
+        current_attr_keys = (dynamic_attributes or []) + (static_attributes or [])
+        past_attr_keys = dynamic_attributes or []
 
         # iterate through alignments:
         for case_id, case_alignment in zip(self.sorted_case_ids, self.alignments):
@@ -206,16 +211,11 @@ class DecisionDiscovery:
                     return np.nan
                 if isinstance(v, bool):
                     return v
-                if isinstance(v, (int, np.integer)):
-                    return str(int(v))
                 return str(v)
 
             def _as_num(v: Any) -> Any:
                 if isinstance(v, (float, np.floating)):
                     return v
-                if isinstance(v, (int, np.integer)):
-                    return float(v)
-                return np.nan
 
             getv = _as_num if is_continuous else _as_cat
 
@@ -230,13 +230,14 @@ class DecisionDiscovery:
         return features
 
     def mine_decision_models(self,
-                             attributes: Optional[List[str]] = None,
+                             method: Optional[str] = 'basic',
                              dynamic_attributes: Optional[List[str]] = None,
                              static_attributes: Optional[List[str]] = None,
-                             model_cfg: Optional[ModelConfig] = None) -> DecisionMiningResult:
+                             mc_config = None) -> DecisionMiningResult:
+        # maybe add model config!
+        
         # train data and legend
-        I, _legend = self.collect_I(attributes=attributes,
-                                    dynamic_attributes=dynamic_attributes,
+        I, _legend = self.collect_I(dynamic_attributes=dynamic_attributes,
                                     static_attributes=static_attributes)
 
         # models for places
@@ -257,30 +258,147 @@ class DecisionDiscovery:
                 rows.append(self._build_feature_row(ass))
                 labels.append(str(chosen))
 
+            # only contains the past_event_counts as past data?
             X_raw = pd.DataFrame(rows)
-            
-            est = FunctionEstimator.fit_from_xy(X_raw,  labels, feature_cols=None, model_cfg=model_cfg or ModelConfig())
-            
+
+            if method == 'basic':
+                est = fe_basic.fit_from_xy(X_raw, labels, feature_cols=None, model_cfg=mc_config or mc_basic())
+            elif method == 'advanced':
+                est = fe_advanced.fit_from_xy(X_raw, labels, feature_cols=None, model_cfg=mc_config or mc_advanced())
+            else:
+                raise ValueError('Only baisc and advanced exist!')
+
             models[place_name] = DecisionPointModel(place_name=place_name, estimator=est)
 
         return DecisionMiningResult(models=models, skipped=skipped)
 
-    def extract_probabilistic_guards(self,
-                                     mining_result: DecisionMiningResult,
-                                     min_leaf_prob: float = 0.2,
-                                     min_leaf_lift: float = 2.0,
-                                     min_leaf_support: int = 20,
-                                     surrogate_max_depth: int = 4,
-                                     surrogate_min_leaf: int = 20,
-                                     always_keep_best: bool = True) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+    def extract_guards(self,
+                       mining_result: DecisionMiningResult,
+                       *,
+                       use_advanced_estimator: bool = False,
+                       ) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
         
         guards_by_place: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
         for place_name, model in mining_result.models.items():
-            #
-            guards_by_place[place_name] = model.estimator.extract_probabilistic_guards_simple(min_leaf_prob=min_leaf_prob,
-                                                                                              min_leaf_lift=min_leaf_lift,
-                                                                                              min_leaf_support=min_leaf_support,
-                                                                                              surrogate_max_depth=surrogate_max_depth,
-                                                                                              surrogate_min_leaf=surrogate_min_leaf,
-                                                                                              always_keep_best=always_keep_best)
+            est = model.estimator
+
+            if bool(use_advanced_estimator):
+                if not hasattr(est, "extract_probabilistic_guards_advanced"):
+                    raise RuntimeError(
+                        f"Estimator for place '{place_name}' does not support advanced guard extraction. "
+                        "Create models using the advanced FunctionEstimator."
+                    )
+                guards_by_place[place_name] = est.extract_probabilistic_guards_advanced()
+            else:
+                if not hasattr(est, "extract_probabilistic_guards"):
+                    raise RuntimeError(
+                        f"Estimator for place '{place_name}' does not support basic guard extraction. "
+                        "Create models using the basic FunctionEstimator."
+                    )
+                guards_by_place[place_name] = est.extract_probabilistic_guards()
+
         return guards_by_place
+
+    def print_summary_and_visualize(self, guards: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> None:
+        """
+        Print a summary of the discovered guards and visualize the Petri net with guard annotations.
+        """
+
+        def _guard_prob(g: Dict[str, Any]) -> float:
+            # FunctionEstimator emits prob_model / prob_emp; older code used prob.
+            if "prob_model" in g:
+                return float(g.get("prob_model", 0.0))
+            if "prob" in g:
+                return float(g.get("prob", 0.0))
+            return float(g.get("prob_emp", 0.0))
+
+        def _format_guard(g: Dict[str, Any]) -> str:
+            parts = []
+            if g.get("intervals"):
+                parts.append("intervals=" + str(g["intervals"]))
+            if g.get("categorical_allowed") or g.get("categorical_excluded"):
+                parts.append(
+                    "cats=" + str({
+                        "allowed": g.get("categorical_allowed", {}),
+                        "excluded": g.get("categorical_excluded", {}),
+                    }))
+
+            parts.append(f"p={_guard_prob(g):.3f}")
+            if "support" in g:
+                parts.append(f"n={g.get('support', 0)}")
+            if "lift" in g:
+                parts.append(f"lift={g.get('lift', 0.0):.2f}")
+
+            rule = g.get("rule", "")
+            raw_rule = g.get("raw_rule", "")
+
+            # Prefer the simplified rule; but if it collapsed to (true) while raw_rule had conditions,
+            # show raw_rule so you can see what was removed (often NaN-dummy splits).
+            if rule and rule != "(true)":
+                parts.append("rule=" + rule)
+            else:
+                if raw_rule and raw_rule != "(true)":
+                    parts.append("raw_rule=" + raw_rule)
+
+            return "; ".join(parts)
+        
+        def _best_guard_text(guard_list):
+            if not guard_list:
+                return ""
+            # pick guard with highest probability (fallback to first)
+            best = max(guard_list, key=_guard_prob)
+            rule = best.get("rule", "")
+            prob = _guard_prob(best)
+            if rule and rule != "(true)":
+                return f"{rule} | p={prob:.2f}"
+            return f"p={prob:.2f}"
+
+        # Optional: exclude likely-silent transitions from printing.
+        # Adjust this regex to match your silent transition naming convention.
+        silent_label_rx = re.compile(r"^(skip_|tau|silent|>>)")
+
+        for place_name, by_label in guards.items():
+            print(f"\\n=== {place_name} ===")
+            if not by_label:
+                print("  (no guards emitted for this place)")
+                continue
+
+            any_printed = False
+            for label, guard_list in by_label.items():
+                if silent_label_rx.search(str(label)):
+                    continue
+                any_printed = True
+                
+                # Use class label from transition object if available
+                trans_obj = self.transition_by_key.get(str(label))
+                display_label = trans_obj.label if trans_obj and hasattr(trans_obj, 'label') and trans_obj.label else str(label)
+                
+                print(f"- {display_label} ({len(guard_list)} guards)")
+                for g in guard_list:
+                    print("  *", _format_guard(g))
+
+            if not any_printed:
+                print("  (all labels filtered as silent)")
+
+        # Visualize the Petri net with guard annotations
+
+        # Build a transition -> guard text map
+        transition_guard_text = {}
+        for place_name, by_label in guards.items():
+            for label, guard_list in by_label.items():
+                transition_guard_text[str(label)] = _best_guard_text(guard_list)
+
+        decorations = {}
+        for t in self.net.transitions:
+            name = str(t.name)
+            guard_text = transition_guard_text.get(name, "")
+            
+            # Use class label for visualization display
+            base_label = t.label if hasattr(t, 'label') and t.label else name
+            
+            label_text = f"{base_label}\\n{guard_text}" if guard_text else base_label
+            decorations[t] = {"label": label_text}
+
+        params = {"decorations": decorations}
+        gviz = pn_vis.apply(self.net, self.im, self.fm, parameters=params)
+        pn_vis.view(gviz)
