@@ -12,6 +12,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
+from pathlib import Path
+import json
+import pickle
 
 import re
 import numpy as np
@@ -29,12 +32,10 @@ class DecisionPointModel:
     place_name: str
     estimator: Any
 
-
 @dataclass
 class DecisionMiningResult:
     models: Dict[str, DecisionPointModel]
     skipped: List[str]
-
 
 class DecisionDiscovery:
     def __init__(self,
@@ -129,11 +130,15 @@ class DecisionDiscovery:
         I: Dict[Any, List[Tuple[Dict[str, Any], Any]]] = defaultdict(list)
         legend = defaultdict(list)
         
-        current_attr_keys = (dynamic_attributes or []) + (static_attributes or [])
-        past_attr_keys = dynamic_attributes or []
+        past_attr_keys = (dynamic_attributes or []) + (static_attributes or [])
 
         # iterate through alignments:
         for case_id, case_alignment in zip(self.sorted_case_ids, self.alignments):
+            case = self.event_log_df[
+                self.event_log_df["case:concept:name"] == case_id
+            ].reset_index(drop=True)
+            case_event_cursor = 0
+
             # past events through the case:
             past_events: List[Dict[str, Any]] = []
             for (log_name, model_name), (log_label, model_label) in case_alignment:
@@ -145,37 +150,34 @@ class DecisionDiscovery:
                         continue
                     # get input places for transition:
                     in_places = self.in_place_for_routing_transition.get(trans, [])
+                    decision_in_places = [p for p in in_places if p in self.decision_places]
 
                     # Add to training data:
                     # if places is not None
-                    for p in in_places:
-                        # if place is a transition place
-                        if p in self.decision_places:
-                            # check if sync move
-                            if log_name != ">>":
-                                attrs: Dict[str, Any] = {}
-                                case = self.event_log_df[self.event_log_df["case:concept:name"] == case_id]
-                                event = case[case["concept:name"] == model_label]
+                    for p in decision_in_places:
+                        attrs = {"past_events": list(past_events)}
+                        I[p].append((attrs, model_name))
+                        legend[p].append(((log_name, model_name), (log_label, model_label)))
 
-                                if not event.empty:
-                                    ev_dict = event.iloc[0].to_dict()
-                                    event_attrs_current = self._filter_attributes(ev_dict, current_attr_keys)
-                                    event_attrs_past = self._filter_attributes(ev_dict, past_attr_keys)
-                                    attrs = dict(event_attrs_current)
-                                attrs["past_events"] = list(past_events)
+                    # Update history with synchronized events only.
+                    # Crucially, this happens after sample creation, so the
+                    # current branching event never leaks into its own features.
+                    if log_name != ">>":
+                        candidate_labels = [lbl for lbl in [log_label, model_label] if lbl]
+                        matched_event = None
+                        for pos in range(case_event_cursor, len(case)):
+                            event_label = case.iloc[pos].get("concept:name", None)
+                            if event_label in candidate_labels:
+                                matched_event = case.iloc[pos]
+                                case_event_cursor = pos + 1
+                                break
 
-                                # add log data
-                                I[p].append((attrs, model_name))
-                            else:
-                                attrs = {}
-                                attrs["past_events"] = list(past_events)
-                                I[p].append((attrs, model_name))
-
-                            if log_name != ">>" and not event.empty:
-                                # Store only dynamic attributes in past_events.
-                                past_events.append(event_attrs_past)
-
-                            legend[p].append(((log_name, model_name), (log_label, model_label)))
+                        if matched_event is not None:
+                            ev_dict = matched_event.to_dict()
+                            event_attrs_past = self._filter_attributes(
+                                ev_dict, past_attr_keys
+                            )
+                            past_events.append(event_attrs_past)
         return I, legend
 
     def _build_feature_row(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
@@ -183,14 +185,56 @@ class DecisionDiscovery:
         past_events = attrs.pop("past_events", [])
         features: Dict[str, Any] = dict(attrs)
 
-        # Minimal history indicators (useful for guards + for downsampling "empty" silent rows).
+        # Minimal history indicators.
         features["past_events_count"] = float(len(past_events))
 
         if not past_events:
             return features
 
-        # Minimal sequential encoding: keep only the most recent values.
-        # This preserves order information without exploding feature count.
+        previous_event = past_events[-1]
+        older_events = past_events[:-1]
+        features["older_events_count"] = float(len(older_events))
+
+        # Keep full data for the immediate previous event.
+        for key, value in previous_event.items():
+            if isinstance(value, (int, np.integer)):
+                value = str(int(value))
+            features[f"{key}_prev_event"] = value
+
+        # Summary for the older event sequence.
+        if older_events:
+            summary_keys: set[str] = set()
+            for ev in older_events:
+                summary_keys.update(ev.keys())
+
+            for key in sorted(summary_keys):
+                seq = [ev.get(key, np.nan) for ev in older_events]
+
+                valid_vals = [
+                    v
+                    for v in seq
+                    if not (
+                        v is None
+                        or (isinstance(v, (float, np.floating)) and np.isnan(v))
+                    )
+                ]
+                features[f"{key}_older_non_null_count"] = float(len(valid_vals))
+
+                if not valid_vals:
+                    continue
+
+                if all(isinstance(v, (float, np.floating)) for v in valid_vals):
+                    arr = np.array(valid_vals, dtype=float)
+                    features[f"{key}_older_mean"] = float(np.nanmean(arr))
+                    features[f"{key}_older_std"] = float(np.nanstd(arr))
+                    features[f"{key}_older_min"] = float(np.nanmin(arr))
+                    features[f"{key}_older_max"] = float(np.nanmax(arr))
+                else:
+                    cat_vals = [str(v) for v in valid_vals]
+                    features[f"{key}_older_last"] = cat_vals[-1]
+                    features[f"{key}_older_nunique"] = float(len(set(cat_vals)))
+
+        # Keep short lag features as additional sequence signal.
         keys: set[str] = set()
         for ev in past_events:
             keys.update(ev.keys())
@@ -272,6 +316,49 @@ class DecisionDiscovery:
 
         return DecisionMiningResult(models=models, skipped=skipped)
 
+    def debug_feature_preview(self,
+                              dynamic_attributes: Optional[List[str]] = None,
+                              static_attributes: Optional[List[str]] = None,
+                              max_rows_per_place: int = 1,
+                              print_rows: bool = True) -> Dict[str, pd.DataFrame]:
+        """
+        Build and optionally print a small preview of feature rows per decision place.
+
+        This helps validate that each branching sample uses only past events,
+        including previous-event data and older-history summaries.
+        """
+        I, _ = self.collect_I(
+            dynamic_attributes=dynamic_attributes,
+            static_attributes=static_attributes,
+        )
+
+        previews: Dict[str, pd.DataFrame] = {}
+        for place, samples in I.items():
+            place_name = str(place)
+            if not samples:
+                previews[place_name] = pd.DataFrame()
+                continue
+
+            rows: List[Dict[str, Any]] = []
+            labels: List[str] = []
+            for attrs, chosen in samples[:max_rows_per_place]:
+                rows.append(self._build_feature_row(attrs))
+                labels.append(str(chosen))
+
+            preview_df = pd.DataFrame(rows)
+            preview_df["target_transition"] = labels
+            previews[place_name] = preview_df
+
+            if print_rows:
+                print(f"\n=== Feature preview for {place_name} (showing {len(preview_df)} row(s)) ===")
+                if preview_df.empty:
+                    print("(no rows)")
+                else:
+                    with pd.option_context("display.max_columns", None, "display.width", 180):
+                        print(preview_df)
+
+        return previews
+
     def extract_guards(self,
                        mining_result: DecisionMiningResult,
                        *,
@@ -298,6 +385,182 @@ class DecisionDiscovery:
                 guards_by_place[place_name] = est.extract_probabilistic_guards()
 
         return guards_by_place
+
+    def save_results(
+        self,
+        *,
+        guards: Dict[str, Dict[str, List[Dict[str, Any]]]],
+        mining_result: Optional[DecisionMiningResult] = None,
+        feature_previews: Optional[Dict[str, pd.DataFrame]] = None,
+        output_dir: Optional[str] = None,
+        guards_json_path: Optional[str] = None,
+        guards_flat_csv_path: Optional[str] = None,
+        skipped_places_path: Optional[str] = None,
+        feature_preview_dir: Optional[str] = None,
+        per_place_json_path: Optional[str] = None,
+        model_dir: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """
+        Persist mined decision artifacts to user-configurable paths.
+
+        Returns a dict with the concrete output paths written.
+        """
+        base_dir = Path(output_dir) if output_dir is not None else Path.cwd() / "decision_mining_results"
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        guards_json = Path(guards_json_path) if guards_json_path else base_dir / "guards.json"
+        guards_csv = Path(guards_flat_csv_path) if guards_flat_csv_path else base_dir / "guards_flat.csv"
+        skipped_csv = Path(skipped_places_path) if skipped_places_path else base_dir / "skipped_places.csv"
+        previews_dir = Path(feature_preview_dir) if feature_preview_dir else base_dir / "feature_previews"
+        per_place_json = Path(per_place_json_path) if per_place_json_path else base_dir / "decision_places_bundle.json"
+        models_dir = Path(model_dir) if model_dir else base_dir / "models"
+
+        guards_json.parent.mkdir(parents=True, exist_ok=True)
+        guards_csv.parent.mkdir(parents=True, exist_ok=True)
+        skipped_csv.parent.mkdir(parents=True, exist_ok=True)
+        previews_dir.mkdir(parents=True, exist_ok=True)
+        per_place_json.parent.mkdir(parents=True, exist_ok=True)
+        models_dir.mkdir(parents=True, exist_ok=True)
+
+        def _safe_name(name: str) -> str:
+            return (
+                str(name)
+                .replace("/", "_")
+                .replace("\\", "_")
+                .replace(" ", "_")
+                .replace(":", "_")
+            )
+
+        def _incoming_transition_tuples(place_obj: Any) -> list[tuple[str, Optional[str]]]:
+            if place_obj is None or not hasattr(place_obj, "in_arcs"):
+                return []
+
+            tuples: list[tuple[str, Optional[str]]] = []
+            for arc in list(getattr(place_obj, "in_arcs", [])):
+                trans = getattr(arc, "source", None)
+                if trans is None:
+                    continue
+                trans_name = str(getattr(trans, "name", ""))
+                trans_label = getattr(trans, "label", None)
+                label_value = str(trans_label) if trans_label is not None else None
+                tuples.append((trans_name, label_value))
+
+            # Deduplicate while preserving order.
+            deduped: list[tuple[str, Optional[str]]] = []
+            seen: set[tuple[str, Optional[str]]] = set()
+            for item in tuples:
+                if item in seen:
+                    continue
+                seen.add(item)
+                deduped.append(item)
+            return deduped
+
+        def _normalize_guards_for_json(
+            guard_dict: Dict[Any, Dict[Any, List[Dict[str, Any]]]]
+        ) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+            normalized: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+            for place_key, by_label in guard_dict.items():
+                place_name = str(place_key)
+                normalized[place_name] = {}
+                for transition_label, guard_list in by_label.items():
+                    normalized[place_name][str(transition_label)] = guard_list
+            return normalized
+
+        guards_serializable = _normalize_guards_for_json(guards)
+
+        # 1) Full guards as JSON (interpretable + probabilistic + set/range based)
+        with guards_json.open("w", encoding="utf-8") as f:
+            json.dump(guards_serializable, f, indent=2, ensure_ascii=False, default=str)
+
+        # 1b) Per-decision-place bundle:
+        # previous incoming transition tuple(s), trained model path, and guards.
+        per_place_records: list[dict[str, Any]] = []
+        models_by_place = {} if mining_result is None else dict(mining_result.models)
+        for place_key, guard_for_place in guards.items():
+            place_name = str(place_key)
+            safe_place_name = _safe_name(place_name)
+            model_path = models_dir / f"{safe_place_name}.pkl"
+
+            model_obj = None
+            if place_key in models_by_place:
+                model_obj = models_by_place[place_key]
+            else:
+                for mk, mv in models_by_place.items():
+                    if str(mk) == place_name:
+                        model_obj = mv
+                        break
+
+            estimator = None if model_obj is None else getattr(model_obj, "estimator", None)
+            if estimator is not None:
+                with model_path.open("wb") as f:
+                    pickle.dump(estimator, f)
+                model_path_str = str(model_path)
+            else:
+                model_path_str = ""
+
+            place_obj_for_arcs = place_key if hasattr(place_key, "in_arcs") else None
+            if place_obj_for_arcs is None and model_obj is not None:
+                place_obj_for_arcs = getattr(model_obj, "place_name", None)
+            previous_transitions = _incoming_transition_tuples(place_obj_for_arcs)
+
+            per_place_records.append(
+                {
+                    "place_name": place_name,
+                    "previous_transitions": previous_transitions,
+                    "model_path": model_path_str,
+                    "guards": guard_for_place,
+                }
+            )
+
+        with per_place_json.open("w", encoding="utf-8") as f:
+            json.dump(per_place_records, f, indent=2, ensure_ascii=False, default=str)
+
+        # 2) Flat guard table for quick analysis
+        flat_rows: List[Dict[str, Any]] = []
+        for place_name, by_label in guards.items():
+            for transition_label, guard_list in by_label.items():
+                for g in guard_list:
+                    flat_rows.append(
+                        {
+                            "place_name": str(place_name),
+                            "transition_label": str(transition_label),
+                            "rule": g.get("rule", ""),
+                            "raw_rule": g.get("raw_rule", ""),
+                            "prob": g.get("prob", np.nan),
+                            "prob_model": g.get("prob_model", np.nan),
+                            "prob_emp": g.get("prob_emp", np.nan),
+                            "support": g.get("support", np.nan),
+                            "coverage": g.get("coverage", np.nan),
+                            "lift": g.get("lift", np.nan),
+                            "intervals": json.dumps(g.get("intervals", {}), ensure_ascii=False),
+                            "categorical_allowed": json.dumps(g.get("categorical_allowed", {}), ensure_ascii=False),
+                            "categorical_excluded": json.dumps(g.get("categorical_excluded", {}), ensure_ascii=False),
+                        }
+                    )
+        pd.DataFrame(flat_rows).to_csv(guards_csv, index=False)
+
+        # 3) Skipped places
+        skipped = [] if mining_result is None else list(mining_result.skipped)
+        pd.DataFrame({"skipped_place": [str(p) for p in skipped]}).to_csv(
+            skipped_csv, index=False
+        )
+
+        # 4) Per-place feature previews (optional)
+        if feature_previews:
+            for place_name, preview_df in feature_previews.items():
+                safe_place_name = _safe_name(str(place_name))
+                preview_path = previews_dir / f"{safe_place_name}.csv"
+                preview_df.to_csv(preview_path, index=False)
+
+        return {
+            "output_dir": str(base_dir),
+            "guards_json_path": str(guards_json),
+            "guards_flat_csv_path": str(guards_csv),
+            "skipped_places_path": str(skipped_csv),
+            "feature_preview_dir": str(previews_dir),
+            "per_place_json_path": str(per_place_json),
+            "model_dir": str(models_dir),
+        }
 
     def print_summary_and_visualize(self, guards: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> None:
         """

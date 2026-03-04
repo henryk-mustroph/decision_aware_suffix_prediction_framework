@@ -4,11 +4,21 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-catboost = "*"
-lightgbm = "*"
-xgboost = "*"
+torch = "*"
+ipykernel = "*"
+jupyter = "*"
+pm4py = "*"
+pandas = "*"
+numpy = "*"
+scikit-learn = "*"
+seaborn = "*"
+crps = "*"
+pyxdameraulevenshtein = "*"
+standard-imghdr = "*"
+python-levenshtein = "*"
 
 [dev-packages]
 
 [requires]
-python_version = "3.13"
+python_version = "3.12"
+python_full_version = "3.12.11"

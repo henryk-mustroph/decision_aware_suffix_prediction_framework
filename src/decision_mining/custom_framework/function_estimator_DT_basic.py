@@ -413,6 +413,7 @@ class FunctionEstimator:
         le = LabelEncoder()
         y_int_full = le.fit_transform(np.asarray(y, dtype=str))
         class_int_to_label = {int(i): str(lbl) for i, lbl in enumerate(le.classes_)}
+        n_classes_total = int(len(le.classes_))
 
         self._priors = _priors_from_ints(y_int_full)
 
@@ -451,7 +452,7 @@ class FunctionEstimator:
 
         # Calibrate (on FULL data for stable probabilities; uses automatic cv fallback)
         clf: Any = base_clf
-        if bool(self.model_cfg.calibrate):
+        if bool(self.model_cfg.calibrate) and n_classes_total >= 2:
             n_samples = int(len(y_int_full))
             counts = np.bincount(y_int_full) if n_samples else np.asarray([], dtype=int)
             nonzero = counts[counts > 0]
@@ -466,8 +467,14 @@ class FunctionEstimator:
                 )
                 # weights for calibration: use inverse-freq on FULL distribution
                 sw_full = compute_inverse_freq_weights(y_int_full) if bool(self.model_cfg.use_inverse_freq_weights) else None
-                cal.fit(X_enc_full, y_int_full, sample_weight=sw_full)
-                clf = cal
+                try:
+                    cal.fit(X_enc_full, y_int_full, sample_weight=sw_full)
+                    clf = cal
+                except ValueError:
+                    # Degenerate calibration folds (or single-class behavior in
+                    # cloned estimators) can fail with predict_proba shape
+                    # mismatches. Fall back to the already fitted base tree.
+                    clf = base_clf
             else:
                 clf = base_clf
 
