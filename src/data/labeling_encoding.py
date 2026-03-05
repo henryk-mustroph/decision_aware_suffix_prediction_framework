@@ -1231,7 +1231,12 @@ class EventLogDataset(Dataset):
         self.eos_padding: torch.Tensor = tensor_bundle["eos_padding"]
         self.zero_padding: torch.Tensor = tensor_bundle["zero_padding"]
 
-        self.decision_data: list[list[tuple[str, dict[str, float]]]] = (
+        self.encoder_decoder: TensorEncoderDecoder = encoder_decoder
+        self.min_suffix_size: Optional[int] = getattr(
+            encoder_decoder, "min_suffix_size", None
+        )
+
+        self.decision_data: torch.Tensor | list[list[tuple[str, dict[str, float]]]] = (
             self._initialize_decision_data()
         )
 
@@ -1240,10 +1245,6 @@ class EventLogDataset(Dataset):
         )
         self.all_static_categories: tuple[list[tuple[str, int, dict[str, int]]]] = (
             all_static_categories
-        )
-        self.encoder_decoder: TensorEncoderDecoder = encoder_decoder
-        self.min_suffix_size: Optional[int] = getattr(
-            encoder_decoder, "min_suffix_size", None
         )
 
     @staticmethod
@@ -1274,12 +1275,8 @@ class EventLogDataset(Dataset):
                 labels.append("")
         return labels
 
-    def _initialize_decision_data(self) -> list[list[tuple[str, dict[str, float]]]]:
-        decision_data: list[list[tuple[str, dict[str, float]]]] = []
-        for i in range(self.zero_padding.shape[0]):
-            activity_labels = self._extract_prefix_activity_labels(i)
-            decision_data.append([(activity_label, {}) for activity_label in activity_labels])
-        return decision_data
+    def _initialize_decision_data(self) -> torch.Tensor:
+        return torch.empty((self.zero_padding.shape[0], 0), dtype=torch.float32)
 
     def __len__(self):
         """
@@ -1340,7 +1337,10 @@ class EventLogDataset(Dataset):
             self.all_static_categories,
             self.encoder_decoder,
         )
-        new_ds.decision_data = [list(self.decision_data[i]) for i in idx]
+        if isinstance(self.decision_data, torch.Tensor):
+            new_ds.decision_data = self.decision_data.index_select(0, idx_tensor)
+        else:
+            new_ds.decision_data = [list(self.decision_data[i]) for i in idx]
         return new_ds
 
     def set_decision_data(
@@ -1349,6 +1349,9 @@ class EventLogDataset(Dataset):
         """
         Set decision data for dataset prefixes.
         """
+        if isinstance(self.decision_data, torch.Tensor):
+            self.decision_data = [[] for _ in range(len(self.decision_data))]
+
         decision_list = list(decision_data)
 
         if indices is None:
@@ -1435,9 +1438,8 @@ class EventLogLoader:
             splitter = EventLogSplitter(**event_log_properties)
             self.train_df, self.val_df, self.test_df = splitter.split(self.event_log)
 
-        self.encoder_decoder = TensorEncoderDecoder(
-            self.train_df, **event_log_properties
-        )
+        self.encoder_decoder = TensorEncoderDecoder(self.train_df, **event_log_properties)
+        
         # Data are transformed
         self.encoder_decoder.train_imputers_encoders()
 
@@ -1469,9 +1471,6 @@ class EventLogLoader:
             df = self.test_df
         else:
             raise ValueError("type must be one of 'train', 'val', or 'test'")
-        encoded_data, all_categories, all_static_categories = (
-            self.encoder_decoder.encode_df(df)
-        )
-        return EventLogDataset(
-            encoded_data, all_categories, all_static_categories, self.encoder_decoder
-        )
+        
+        encoded_data, all_categories, all_static_categories = self.encoder_decoder.encode_df(df)
+        return EventLogDataset(encoded_data, all_categories, all_static_categories, self.encoder_decoder)
