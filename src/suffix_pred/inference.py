@@ -171,6 +171,7 @@ class Decoder:
         if method is None or not callable(method):
             raise TypeError( f"Model used with {self.__class__.__name__} must implement callable '{method_name}(...)'.")
 
+# Monte Carlo Suffix sampling
 class MCSA(Decoder):
     """
     Adopted Monte-Carlo Suffix Sampling Algorithm: sampling suffixes for evaluation.
@@ -240,17 +241,14 @@ class MCSA(Decoder):
             next_event = (list(cat_predictions.values()), [])
 
             if self.variational_dropout_sampling:
-                prediction, (h, c) = self.model.inference(
-                    last_event=next_event,
-                    hx=(h, c),
-                    z=z,
-                )
+                prediction, (h, c) = self.model.inference(last_event=next_event,
+                                                          hx=(h, c),
+                                                          z=z)
+                
             else:
-                prediction, (h, c) = self.model.inference(
-                    last_event=next_event,
-                    hx=(h, c),
-                    z=None,
-                )
+                prediction, (h, c) = self.model.inference(last_event=next_event,
+                                                          hx=(h, c),
+                                                          z=None)
 
             i += 1
 
@@ -291,21 +289,20 @@ class MCSA(Decoder):
             for _, (prefix_len, prefix, zero_mask, statics, suffix) in enumerate(self._iterate_case(full_case)):
                 prefix_activity = self._decode_activity_prefix(prefix)
                 suffix_activity_sequence = self._decode_activity_suffix(suffix)
-                sampled_suffixes = self.predict_probabilistic_suffix(
-                    prefix=prefix,
-                    prefix_len=prefix_len,
-                    static_inputs=statics,
-                    mask=zero_mask,
-                    include_model_states=include_model_states,
-                )
-                yield (
-                    case_name,
-                    prefix_len,
-                    prefix_activity,
-                    suffix_activity_sequence,
-                    sampled_suffixes,
-                )
+                
+                sampled_suffixes = self.predict_probabilistic_suffix(prefix=prefix,
+                                                                     prefix_len=prefix_len,
+                                                                     static_inputs=statics,
+                                                                     mask=zero_mask,
+                                                                     include_model_states=include_model_states)
+                yield (case_name,
+                       prefix_len,
+                       prefix_activity,
+                       suffix_activity_sequence,
+                       sampled_suffixes)
 
+
+# Arg-max activity sampling for camargo:
 class Mode(Decoder):
     """
     Deterministic arg-max activity suffix decoding (Camargo-style inference).
@@ -329,8 +326,44 @@ class Mode(Decoder):
                 "Model used with Mode must be callable and return activity probabilities."
             )
 
-    def _roll_prefix_with_activity(self, prefix, activity_id: int):
+        # Optional feature projection for models (e.g. C-LSTM) that consume a subset
+        # of dataset dynamic features defined in model.model_feat.
+        self._cat_feature_indices = None
+        self._num_feature_indices = None
+        self._init_model_feature_projection()
+
+    def _init_model_feature_projection(self):
+        model_feat = getattr(self.model, "model_feat", None)
+        if model_feat is None:
+            return
+
+        dataset_cat_names = [cat[0] for cat in self.dataset.all_categories[0]]
+        dataset_num_names = [num[0] for num in self.dataset.all_categories[1]]
+        model_cat_names, model_num_names = model_feat
+
+        missing_cat = [name for name in model_cat_names if name not in dataset_cat_names]
+        missing_num = [name for name in model_num_names if name not in dataset_num_names]
+        if missing_cat or missing_num:
+            raise ValueError(
+                "Model features are missing in dataset categories for Mode decoding. "
+                f"Missing categorical: {missing_cat}, missing numerical: {missing_num}."
+            )
+
+        self._cat_feature_indices = [dataset_cat_names.index(name) for name in model_cat_names]
+        self._num_feature_indices = [dataset_num_names.index(name) for name in model_num_names]
+
+    def _project_prefix_for_model(self, prefix):
+        if self._cat_feature_indices is None and self._num_feature_indices is None:
+            return prefix
+
         prefix_cats, prefix_nums = prefix
+        selected_cats = [prefix_cats[i] for i in self._cat_feature_indices]
+        selected_nums = [prefix_nums[i] for i in self._num_feature_indices]
+        return (selected_cats, selected_nums)
+
+    def _roll_prefix_with_activity(self, prefix, suffix, step_idx: int, activity_id: int):
+        prefix_cats, prefix_nums = prefix
+        suffix_cats, suffix_nums = suffix
 
         new_cats = []
         for i, cat in enumerate(prefix_cats):
@@ -338,18 +371,24 @@ class Mode(Decoder):
             if i == self.concept_name_id:
                 shifted[:, -1] = activity_id
             else:
-                shifted[:, -1] = 0
+                if step_idx < suffix_cats[i].shape[1]:
+                    shifted[:, -1] = suffix_cats[i][:, step_idx]
+                else:
+                    shifted[:, -1] = 0
             new_cats.append(shifted)
 
         new_nums = []
-        for num in prefix_nums:
+        for i, num in enumerate(prefix_nums):
             shifted = torch.roll(num.clone(), shifts=-1, dims=1)
-            shifted[:, -1] = num[:, -1]
+            if step_idx < suffix_nums[i].shape[1]:
+                shifted[:, -1] = suffix_nums[i][:, step_idx]
+            else:
+                shifted[:, -1] = num[:, -1]
             new_nums.append(shifted)
 
         return (new_cats, new_nums)
 
-    def decode_suffix(self, prefix, prefix_len):
+    def decode_suffix(self, prefix, suffix, prefix_len):
         max_iteration = (
             self.dataset.encoder_decoder.window_size
             - self.dataset.encoder_decoder.min_suffix_size
@@ -359,15 +398,21 @@ class Mode(Decoder):
         current_prefix = ([t.clone() for t in prefix[0]], [t.clone() for t in prefix[1]])
         decoded = []
 
-        for _ in range(max_iteration + 1):
-            probs = self.model(current_prefix)
+        for step_idx in range(max_iteration + 1):
+            model_prefix = self._project_prefix_for_model(current_prefix)
+            probs = self.model(model_prefix)
             activity_id = int(torch.argmax(probs, dim=-1).item())
 
             if activity_id == self.eos_id:
                 break
 
             decoded.append(self._activity_label(activity_id))
-            current_prefix = self._roll_prefix_with_activity(current_prefix, activity_id)
+            current_prefix = self._roll_prefix_with_activity(
+                prefix=current_prefix,
+                suffix=suffix,
+                step_idx=step_idx,
+                activity_id=activity_id,
+            )
 
         return decoded
 
@@ -381,7 +426,7 @@ class Mode(Decoder):
             for _, (prefix_len, prefix, _, _, suffix) in enumerate(self._iterate_case(full_case)):
                 prefix_activity = self._decode_activity_prefix(prefix)
                 target_suffix = self._decode_activity_suffix(suffix)
-                decoded_suffixes = [self.decode_suffix(prefix=prefix, prefix_len=prefix_len)]
+                decoded_suffixes = [self.decode_suffix(prefix=prefix, suffix=suffix, prefix_len=prefix_len)]
                 yield (
                     case_name,
                     prefix_len,
@@ -391,6 +436,7 @@ class Mode(Decoder):
                 )
 
 
+# beam search for activity sequences of Taymouri et. al.
 class Beam(Decoder):
     """
     Fixed-width beam-search activity suffix decoding (Taymouri-style inference).
@@ -413,28 +459,72 @@ class Beam(Decoder):
         self.beam_width = beam_width
         self._require_model_method("beam_search")
 
+        # Feature projection (same pattern as Mode decoder)
+        self._cat_feature_indices = None
+        self._num_feature_indices = None
+        self._init_model_feature_projection()
+
+    def _init_model_feature_projection(self):
+        model_feat = getattr(self.model, "model_feat", None)
+        if model_feat is None:
+            return
+
+        dataset_cat_names = [cat[0] for cat in self.dataset.all_categories[0]]
+        dataset_num_names = [num[0] for num in self.dataset.all_categories[1]]
+        model_cat_names, model_num_names = model_feat
+
+        missing_cat = [name for name in model_cat_names if name not in dataset_cat_names]
+        missing_num = [name for name in model_num_names if name not in dataset_num_names]
+        if missing_cat or missing_num:
+            raise ValueError(
+                "Model features are missing in dataset categories for Beam decoding. "
+                f"Missing categorical: {missing_cat}, missing numerical: {missing_num}."
+            )
+
+        self._cat_feature_indices = [dataset_cat_names.index(name) for name in model_cat_names]
+        self._num_feature_indices = [dataset_num_names.index(name) for name in model_num_names]
+
+    def _project_prefix_for_model(self, prefix):
+        if self._cat_feature_indices is None and self._num_feature_indices is None:
+            return prefix
+
+        prefix_cats, prefix_nums = prefix
+        selected_cats = [prefix_cats[i] for i in self._cat_feature_indices]
+        selected_nums = [prefix_nums[i] for i in self._num_feature_indices]
+        return (selected_cats, selected_nums)
+
+    def _decode_beam_ids(self, beam_ids_1d):
+        """Convert a single beam's token id list to activity labels, stopping at EOS/pad."""
+        decoded = []
+        for token in beam_ids_1d:
+            token = int(token)
+            if token == 0 or token == self.eos_id:
+                break
+            decoded.append(self._activity_label(token))
+        return decoded
+
     def decode_suffix(self, prefix, prefix_len):
+        """Return all beam candidates as a list of decoded activity-label sequences."""
         max_iteration = (
             self.dataset.encoder_decoder.window_size
             - self.dataset.encoder_decoder.min_suffix_size
             - prefix_len
         )
 
+        model_prefix = self._project_prefix_for_model(prefix)
         beam_ids = self.model.beam_search(
-            prefixes=prefix,
+            prefixes=model_prefix,
             beam_width=self.beam_width,
             max_len=max_iteration + 1,
             eos_id=self.eos_id,
         )
 
-        best_ids = beam_ids[0].tolist()
-        decoded = []
-        for token in best_ids:
-            token = int(token)
-            if token == 0 or token == self.eos_id:
-                break
-            decoded.append(self._activity_label(token))
-        return decoded
+        # beam_ids shape: [1, beam_width, max_len] (batch=1 per call)
+        all_beams = beam_ids[0]  # [beam_width, max_len]
+        decoded_beams = []
+        for k in range(all_beams.shape[0]):
+            decoded_beams.append(self._decode_beam_ids(all_beams[k].tolist()))
+        return decoded_beams
 
     def evaluate(self, random_order=False, include_model_states=False):
         self._ensure_eval_mode()
@@ -446,7 +536,7 @@ class Beam(Decoder):
             for _, (prefix_len, prefix, _, _, suffix) in enumerate(self._iterate_case(full_case)):
                 prefix_activity = self._decode_activity_prefix(prefix)
                 target_suffix = self._decode_activity_suffix(suffix)
-                decoded_suffixes = [self.decode_suffix(prefix=prefix, prefix_len=prefix_len)]
+                decoded_suffixes = self.decode_suffix(prefix=prefix, prefix_len=prefix_len)
                 yield (case_name,
                        prefix_len,
                        prefix_activity,
