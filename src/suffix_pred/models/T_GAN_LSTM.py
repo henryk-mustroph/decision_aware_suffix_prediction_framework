@@ -117,9 +117,9 @@ class Discriminator(nn.Module):
 
 
 def init_weights(m):
-    """Uniform weight initialization (Taymouri et al.)."""
+    """Normal weight initialization (Taymouri et al., standard normal distribution)."""
     for name, param in m.named_parameters():
-        nn.init.uniform_(param.data, -0.08, 0.08)
+        nn.init.normal_(param.data, mean=0.0, std=0.08)
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +354,10 @@ class TaymouriAdversarialLSTM(nn.Module):
             predictions.append(torch.stack(batch_beams, dim=0))
 
         return torch.stack(predictions, dim=0)
+
+    def init_weights_normal(self):
+        """Initialize G and D parameters (Algorithm 1, step 1: standard normal distribution)."""
+        self.apply(init_weights)
 
     # -- persistence ---------------------------------------------------------
 

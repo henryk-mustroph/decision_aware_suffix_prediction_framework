@@ -14,6 +14,7 @@ os.environ["TORCH_NUM_THREADS"] = "1"
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+import math
 from tqdm.notebook import tqdm
 from typing import Optional
 
@@ -27,7 +28,6 @@ class Trainer:
     """
     General base trainer for shared training setup and utilities.
     """
-
     def __init__(self,
                  device,
                  model,
@@ -52,13 +52,12 @@ class Trainer:
         self.save_model_n_th_epoch = save_model_n_th_epoch
         self.saving_path = saving_path
 
-    def _build_dataloader(self, dataset, num_workers=0):
+    def _build_dataloader(self, dataset, num_workers=8):
         return DataLoader(dataset=dataset,
                           batch_size=self.mini_batches,
                           shuffle=self.shuffle,
-                          # num_workers=num_workers,
-                          # pin_memory=True
-                          )
+                          num_workers=num_workers,
+                          pin_memory=True)
 
     def _save_model(self):
         self.model.save(self.saving_path)
@@ -78,28 +77,18 @@ class Trainer:
             self._save_model()
 
     def _unpack_batch_common(self, batch):
-        """
-        Normalized batch unpacking.
-
-        Required format:
-        - 8-tuple full dataset format: (_, cats, nums, eos, zero, cats_static, nums_static, _)
-        """
         if len(batch) == 8:
             _, cats, nums, eos_paddings, zero_paddings, cats_static, nums_static, _ = batch
         else:
             raise ValueError(
-                f"Unsupported batch format with len={len(batch)}. "
-                "Expected full 8-tuple: (_, cats, nums, eos, zero, cats_static, nums_static, _)."
-            )
+                f"Unsupported batch format with len={len(batch)}. " "Expected full 8-tuple: (_, cats, nums, eos, zero, cats_static, nums_static, _).")
 
-        return {
-            "cats": cats,
-            "nums": nums,
-            "eos_paddings": eos_paddings,
-            "zero_paddings": zero_paddings,
-            "cats_static": cats_static,
-            "nums_static": nums_static,
-        }
+        return {"cats": cats,
+                "nums": nums,
+                "eos_paddings": eos_paddings,
+                "zero_paddings": zero_paddings,
+                "cats_static": cats_static,
+                "nums_static": nums_static}
 
     def _prepare_static_inputs(self, cats_static, nums_static):
         static_cat = None
@@ -148,6 +137,7 @@ class Trainer:
         return prefix_mask, eos_paddings_suffix
 
 
+# Trainer for the U-ED-LSTM: 
 class KTrainer(Trainer):
     def __init__(self,
                  device,
@@ -159,19 +149,15 @@ class KTrainer(Trainer):
                  optimize_values,
                  suffix_data_split_value,
                  save_model_n_th_epoch: int = 0,
-                 saving_path: str = 'model.pkl',
-                 random_suffix_split: bool = False):
-        """
-        Trainer class constructor.
-        
-        ARGS:
+                 saving_path: str = 'U_ED_LSTM_train.pkl'):
+        """        
+        Args:
         - device: Device (GPU or CPU).
         - model: Model that is trained and validated.
         - data_train: Training data.
         - data_val: Validation data.
         - loss_obj: object for loss functions
         - log_normal_loss_num_feature: list of strings of num feaures that follow log normal distribution.
-        
         - optimize_values:
             - regularization_term: L2 regularization for weights, biases, and dropout of stochastic model. 
             - optimizer: Optimization algorithm for training.
@@ -180,30 +166,24 @@ class KTrainer(Trainer):
             - shuffles: Shuffle batches.
             - min teacher_forcing_ratio: Value [0,1) that is used to decide if predicted or next target event is used for next prediction by model.
             - max teacher_forcing_ratio: Value [0,1) that is used to decide if predicted or next target event is used for next prediction by model.
-        
         - suffix_data_split_value: Number of last values of suffix events. 
-        
         - save_model_n_th_epoch: int,
         - saving_path: str, default: 'model.pkl'
-        - random_suffix_split: bool, default: False. If True, randomly splits prefix/suffix per batch.
         """
 
         # Standard Training parameters
-        super().__init__(
-            device=device,
-            model=model,
-            data_train=data_train,
-            data_val=data_val,
-            optimize_values=optimize_values,
-            save_model_n_th_epoch=save_model_n_th_epoch,
-            saving_path=saving_path,
-        )
+        super().__init__(device=device,
+                         model=model,
+                         data_train=data_train,
+                         data_val=data_val,
+                         optimize_values=optimize_values,
+                         save_model_n_th_epoch=save_model_n_th_epoch,
+                         saving_path=saving_path)
 
         print("Device: ", device)
         print("Model: ", model)
 
         print("Train Dataset: ", data_train)
-
         print("Validation Dataset: ", data_val)
         
         self.loss_obj = loss_obj
@@ -226,10 +206,11 @@ class KTrainer(Trainer):
         
         # Events in sufffix: Dependent on data set
         self.suffix_data_split_value = suffix_data_split_value
-        self.random_suffix_split = random_suffix_split
 
     def _select_activity_feature_name(self, cat_features_indeces, predictions_cat):
-        """Pick the categorical activity feature key from decoder outputs."""
+        """
+        Pick the categorical activity feature key from decoder outputs.
+        """
         if "concept:name" in cat_features_indeces:
             return "concept:name"
 
@@ -246,15 +227,13 @@ class KTrainer(Trainer):
         return mean_feature_names[0]
     
     def train_model(self, use_statics:Optional[bool]=False, use_zero_padd_masking:Optional[bool]=False, use_eos_padd_masking:Optional[bool]=False):
-        """
-        Seq2Seq Multi Task Learning algorithm with uncertainties.
-        
-        INPUTS:
+        """        
+        Inputs:
         - use_statics:
         - use_zero_padd_masking:
         - use_eos_padd_masking:
         
-        OUTPUTS:
+        Outputs:
         - train_attenuated_losses:
         - val_losses
         - val_attenuated_losses
@@ -271,7 +250,7 @@ class KTrainer(Trainer):
         val_dataloader = self._build_dataloader(self.data_val, num_workers=4)
                 
         # Trainings/ Epoch Loop
-        for epoch in range(self.epochs):#tqdm(range(self.epochs)):
+        for epoch in tqdm(range(self.epochs)):#range(self.epochs):
             
             # Train dataloader
             train_dataloader = self._build_dataloader(self.data_train, num_workers=0)
@@ -348,8 +327,7 @@ class KTrainer(Trainer):
             
             train_attenuated_losses.append(epoch_loss_train)
             
-            # Validation
-            epoch_cat_loss_val_std, epoch_cat_loss_val_unc,\
+            # Validation            
             epoch_loss_val_std, epoch_loss_val_unc = self.validation_epoch(val_dataloader=val_dataloader,
                                                                             use_statics=use_statics,
                                                                             use_zero_padd_masking=use_zero_padd_masking,
@@ -361,7 +339,6 @@ class KTrainer(Trainer):
             val_losses.append(epoch_loss_val_std)
             val_attenuated_losses.append(epoch_loss_val_unc)
 
-            
             # Adjust the learning rate if necessary
             tqdm.write(f"Validation Loss for Scheduler: {epoch_loss_val_std:.4f}")
             
@@ -378,18 +355,7 @@ class KTrainer(Trainer):
 
     def train_epoch(self, prefixes, suffixes, eos_paddings, prefix_mask=None, static_inputs=None):
         """
-        Train the model on batches.
-
-        INPUTS:
-        - prefixes: 
-        - suffixes:
-        - eos_paddings: Optional EOS mask tensor matching suffix shape.
-        - prefix_mask: Zero-padding mask for the encoder prefix (batch x seq_len)
-        - static_inputs 
-
-        OUTPUTS:
-        - all_losses:
-        - loss: 
+        one epoch iteration
         """
         # predictions: List of two Dicts one for categorical (means and vars), one for numerical (means and vars): key: feature name + _mean or _var, value: tensor with dim: seq len x batch size x output feature size
         # data_features_indeces_dec: List of two Dicts one for categorical, one for numerical: key: feature name, value: index of tensor in data list
@@ -459,15 +425,6 @@ class KTrainer(Trainer):
     def validation_epoch(self, val_dataloader, use_statics=False, use_zero_padd_masking=False, use_eos_padd_masking=False):
         """
         Validates the model on the validation set during training.
-
-        INPUTS:
-        - val_dataloader: Validation data for validating the model during training.
-        
-        OUTPUTS:
-        - cat_loss_dict_std: Cat. event attributes standard loss
-        - cat_loss_dict_unc: Cat. event attributes attenuated loss
-        - val_epoch_loss_std: Total categorical standard loss
-        - val_epoch_loss_unc: Total categorical attenuated loss
         """
         # Set model to evaluation mode
         self.model.eval()
@@ -493,18 +450,12 @@ class KTrainer(Trainer):
                 else:
                     static_inputs = None
                 
-                prefixes, suffixes = self._split_prefix_suffix(
-                    cats=cats,
-                    nums=nums,
-                    suffix_size=self.suffix_data_split_value,
-                )
-                prefix_mask, eos_paddings_suffix = self._build_masks(
-                    eos_paddings=eos_paddings,
-                    zero_paddings=zero_paddings,
-                    suffix_size=self.suffix_data_split_value,
-                    use_zero_padd_masking=use_zero_padd_masking,
-                    use_eos_padd_masking=use_eos_padd_masking,
-                )
+                prefixes, suffixes = self._split_prefix_suffix(cats=cats, nums=nums, suffix_size=self.suffix_data_split_value)
+                prefix_mask, eos_paddings_suffix = self._build_masks(eos_paddings=eos_paddings,
+                                                                     zero_paddings=zero_paddings,
+                                                                     suffix_size=self.suffix_data_split_value,
+                                                                     use_zero_padd_masking=use_zero_padd_masking,
+                                                                     use_eos_padd_masking=use_eos_padd_masking)
 
                 # Model predictions:
                 predictions, _, _, data_features_indeces_dec= self.model(prefixes=prefixes,
@@ -563,9 +514,7 @@ class KTrainer(Trainer):
         # Set model back to train for gradient caluclation and optimization.
         self.model.train()
         
-        return cat_loss_dict_std, cat_loss_dict_unc, val_epoch_loss_std, val_epoch_loss_unc
-
-
+        return val_epoch_loss_std, val_epoch_loss_unc
 
 
 # Training for camargo LSTM: 
@@ -580,7 +529,7 @@ class CTraining(Trainer):
                  eos_id, 
                  loss_obj=None,
                  save_model_n_th_epoch: int = 0,
-                 saving_path: str = 'reimpl_model.pkl'):
+                 saving_path: str = 'C_LSTM.pkl'):
         
         super().__init__(device=device,
                          model=model,
@@ -609,7 +558,9 @@ class CTraining(Trainer):
         print("Shuffle batched dataset: ", self.shuffle)
 
     def _init_prefix_feature_indices(self):
-        """Map configured model feature names to dataset tensor indices."""
+        """
+        Map configured model feature names to dataset tensor indices.
+        """
         cat_categories, num_categories = self.data_train.all_categories
         cat_names_dataset = [cat[0] for cat in cat_categories]
         num_names_dataset = [num[0] for num in num_categories]
@@ -626,21 +577,16 @@ class CTraining(Trainer):
         missing_cat = [name for name in model_cat_names if name not in cat_names_dataset]
         missing_num = [name for name in model_num_names if name not in num_names_dataset]
         if missing_cat or missing_num:
-            raise ValueError(
-                "Configured model features are missing in dataset categories. "
-                f"Missing categorical: {missing_cat}, missing numerical: {missing_num}."
-            )
+            raise ValueError("Configured model features are missing in dataset categories. "f"Missing categorical: {missing_cat}, missing numerical: {missing_num}.")
 
         self.prefix_cat_feature_indices = [cat_names_dataset.index(name) for name in model_cat_names]
         self.prefix_num_feature_indices = [num_names_dataset.index(name) for name in model_num_names]
         
     def _preprocess_batch(self, cats, nums, eos_paddings=None):
         """
-        Prepare C-LSTM inputs from full-sequence tensors.
-
         C-training is next-event prediction, so supervision length is fixed to S=1
-        (target is the final activity token of the sequence).
         """
+        
         if len(cats) == 0:
             return None, None, None, 0
 
@@ -677,9 +623,6 @@ class CTraining(Trainer):
     def train(self):
         """
         Run full training and validation loops.
-        Returns:
-            train_losses: list of training epoch losses
-            val_losses: list of validation epoch losses
         """
         self.model.train()
         
@@ -719,11 +662,9 @@ class CTraining(Trainer):
                 # Compute losses
                 # Activity: standard CE from loss.py (single-step sequence)
                 pred_logits = torch.log(a_probs.clamp_min(1e-8)).unsqueeze(0)  # [1, B, C]
-                act_loss = self.loss_obj.standard_cross_entropy(
-                    pred_logits=pred_logits,
-                    targets=target_act.unsqueeze(1),
-                    eos_paddings=eos_next,
-                )
+                act_loss = self.loss_obj.standard_cross_entropy(pred_logits=pred_logits,
+                                                                targets=target_act.unsqueeze(1),
+                                                                eos_paddings=eos_next)
 
                 loss = act_loss
 
@@ -736,25 +677,19 @@ class CTraining(Trainer):
                 total += loss.item()
                 num_batches += 1
 
-            # epoch averages train loss:
-            epoch_loss = total / max(1, num_batches)
-            
             # Current learning rate
             current_lr = self._current_lr()
             
+            # epoch averages train loss:
+            epoch_loss = total / max(1, num_batches)            
             # Prints per Epoch:
             tqdm.write(f"Epoch [{epoch+1}/{self.epochs}], Learning Rate: {current_lr}")
-            
             tqdm.write(f"Training: Avg Attenuated Training Loss: {epoch_loss:.4f}")
-            
             train_losses.append(epoch_loss)
             
             val_loss = self._validate(loader=val_dataloader)
-            
             tqdm.write(f"Validation: Avg Validation Loss: {val_loss:.4f}")
-            
             val_losses.append(val_loss)
-            
             # Adjust the learning rate if necessary
             tqdm.write(f"Validation Loss for Scheduler: {val_loss:.4f}")
             
@@ -767,8 +702,7 @@ class CTraining(Trainer):
         self._save_model()
         tqdm.write(f'Model saved to path: {self.saving_path}')
 
-        # return train_losses, val_losses
-
+        return train_losses, val_losses
 
     def _validate(self, loader):
         self.model.eval()
@@ -786,11 +720,9 @@ class CTraining(Trainer):
                 cats_static = batch["cats_static"]
                 nums_static = batch["nums_static"]
 
-                prefixes, target_act, eos_next, V = self._preprocess_batch(
-                    cats=cats,
-                    nums=nums,
-                    eos_paddings=eos_paddings,
-                )
+                prefixes, target_act, eos_next, V = self._preprocess_batch(cats=cats,
+                                                                           nums=nums,
+                                                                           eos_paddings=eos_paddings)
                 
                 if V == 0:
                     continue
@@ -798,11 +730,9 @@ class CTraining(Trainer):
                 a_probs = self.model(input=prefixes)
 
                 pred_logits = torch.log(a_probs.clamp_min(1e-8)).unsqueeze(0)  # [1, B, C]
-                act_loss = self.loss_obj.standard_cross_entropy(
-                    pred_logits=pred_logits,
-                    targets=target_act.unsqueeze(1),
-                    eos_paddings=eos_next,
-                )
+                act_loss = self.loss_obj.standard_cross_entropy(pred_logits=pred_logits,
+                                                                targets=target_act.unsqueeze(1),
+                                                                eos_paddings=eos_next)
 
                 total_loss += act_loss.item()
                 num_batches += 1
@@ -812,16 +742,28 @@ class CTraining(Trainer):
 
 # trainings class for Taymouri et.al. GAN based LSTM for suffix prediction
 class TTraining(Trainer):
-    """Trainer for TaymouriAdversarialLSTM (Taymouri et al.).
+    """
+    Trainer for Taymouri's GAN encoder-decoder LSTM (Algorithm 1: MLMME).
 
-    Supports two training modes controlled by ``use_gan`` in *optimize_values*:
-    - **MLE** (``use_gan=False``): standard cross-entropy on activity suffixes
-      with teacher forcing and fixed suffix length S (same as KTrainer / UED-LSTM).
-    - **GAN** (``use_gan=True``): adversarial training (Gumbel-softmax
-      discriminator step + generator adversarial loss) combined with MLE.
+    Implements adversarial training with Gumbel-softmax for differentiable
+    categorical suffix generation, following:
+      Taymouri, La Rosa, Erfani — SDM 2021.
 
-    Data structure follows the same 8-tuple convention as the full loader
-    (C_LSTM, UED-LSTM).  Prefix features are projected to ``model.model_feat``.
+    Training procedure (Algorithm 1):
+      1. Initialize G and D parameters (standard normal distribution)
+      2. For each iteration (epoch):
+         For each (σ≤k, σ>k) ∈ S:
+           - Update θd by minimizing L(D;G) = -log(D(σ>k)) - log(1 - D(σ̂>k))
+           - Update θg by minimizing L(G;D) + L_supervised
+      3. Temperature τ of Gumbel-softmax anneals exponentially from 0.9 → ~0.
+
+    Recommended configuration (Taymouri et al.):
+      - RMSprop optimizer, lr=5e-5
+      - Gradient norm clipping to 1
+      - 100 iterations (epochs)
+      - Teacher forcing with linear annealing
+
+    When ``use_gan=False`` in optimize_values, only L_supervised is used (MLE-only).
     """
 
     def __init__(self,
@@ -852,27 +794,26 @@ class TTraining(Trainer):
         self.concept_name_id = concept_name_id
         self.eos_id = eos_id
 
-        # Teacher forcing (linearly annealed like KTrainer / UED-LSTM)
+        # Teacher forcing
         self.min_teacher_forcing_value = optimize_values.get("min_teacher_forcing_value", 0.0)
         self.max_teacher_forcing_value = optimize_values.get("max_teacher_forcing_value", 0.5)
 
+        # Gumbel-softmax temperature annealing (τ: 0.9 → ~0, exponential)
+        self.tau_start = optimize_values.get("tau_start", 0.9)
+        self.tau_min = optimize_values.get("tau_min", 0.01)
+
         # GAN vs MLE switch
         self.use_gan = optimize_values.get("use_gan", True)
-        self.lambda_adv = optimize_values.get("lambda_adv", 0.1)
         self.beam_width = optimize_values.get("beam_width", 3)
 
-        # Optimizers
+        # Optimizers: G (encoder-decoder) and D (discriminator)
         self.generator_optimizer = optimize_values.get("generator_optimizer", optimize_values.get("optimizer", None))
-        self.discriminator_optimizer = None
-        if self.use_gan:
-            self.discriminator_optimizer = optimize_values.get("discriminator_optimizer", None)
-            if self.discriminator_optimizer is None:
-                self.discriminator_optimizer = torch.optim.AdamW(
-                    list(self.model.discriminator_lstm.parameters()) + list(self.model.discriminator_head.parameters()),
-                    lr=1e-3,
-                )
         if self.generator_optimizer is None:
             raise ValueError("Provide `generator_optimizer` (or `optimizer`) in optimize_values.")
+
+        self.discriminator_optimizer = optimize_values.get("discriminator_optimizer", None)
+        if self.use_gan and self.discriminator_optimizer is None:
+            raise ValueError("Provide `discriminator_optimizer` in optimize_values for GAN training.")
 
         self.generator_scheduler = optimize_values.get("generator_scheduler", optimize_values.get("scheduler", None))
         self.discriminator_scheduler = optimize_values.get("discriminator_scheduler", None) if self.use_gan else None
@@ -882,7 +823,11 @@ class TTraining(Trainer):
         self.prefix_num_feature_indices = None
         self._init_prefix_feature_indices()
 
-    # -- feature projection --------------------------------------------------
+        print("Device: ", device)
+        print("Mode: ", "GAN (Algorithm 1: MLMME)" if self.use_gan else "MLE-only")
+        print("Epochs (iterations): ", self.epochs)
+        print("Gumbel-softmax τ: ", f"{self.tau_start} → {self.tau_min} (exponential anneal)")
+        print("Teacher forcing: ", f"{self.max_teacher_forcing_value} → {self.min_teacher_forcing_value}")
 
     def _init_prefix_feature_indices(self):
         """Map configured model feature names to dataset tensor indices."""
@@ -909,8 +854,6 @@ class TTraining(Trainer):
         self.prefix_cat_feature_indices = [cat_names_dataset.index(name) for name in model_cat_names]
         self.prefix_num_feature_indices = [num_names_dataset.index(name) for name in model_num_names]
 
-    # -- batch handling ------------------------------------------------------
-
     def _unpack_batch(self, batch):
         """Split batch into model-projected prefixes, activity targets, and EOS mask."""
         unpacked = self._unpack_batch_common(batch)
@@ -919,11 +862,9 @@ class TTraining(Trainer):
         eos_paddings = unpacked["eos_paddings"]
 
         # Split into prefix / suffix with fixed S (same as KTrainer)
-        prefixes, suffixes = self._split_prefix_suffix(
-            cats=cats,
-            nums=nums,
-            suffix_size=self.suffix_data_split_value,
-        )
+        prefixes, suffixes = self._split_prefix_suffix(cats=cats,
+                                                       nums=nums,
+                                                       suffix_size=self.suffix_data_split_value)
 
         # Project prefix features to model_feat subset
         prefix_cats, prefix_nums = prefixes
@@ -940,16 +881,23 @@ class TTraining(Trainer):
 
     def _masked_activity_loss(self, logits, targets, eos_mask=None):
         """Cross-entropy loss. logits: [S, B, C], targets: [B, S]."""
-        return self.loss_obj.standard_cross_entropy(
-            pred_logits=logits,
-            targets=targets,
-            eos_paddings=eos_mask,
-        )
-
-    # -- training loop -------------------------------------------------------
+        return self.loss_obj.standard_cross_entropy(pred_logits=logits,
+                                                    targets=targets,
+                                                    eos_paddings=eos_mask)
 
     def train(self):
-        """Run MLE or GAN training loop depending on ``self.use_gan``."""
+        """
+        Adversarial training (Algorithm 1: MLMME, Taymouri et al. SDM 2021).
+
+        For each iteration (epoch):
+          Gumbel-softmax temperature τ annealed exponentially from 0.9 → ~0.
+          For each batch (σ≤k, σ>k) ∈ S:
+            1. Update θd by minimizing L(D;G) = -log(D(σ>k)) - log(1 - D(σ̂>k))
+            2. Update θg by minimizing L(G;D) + L_supervised
+               where L(G;D) = -[log(D(σ̂>k)) - log(1 - D(σ̂>k))]
+
+        When use_gan=False, only L_supervised is used.
+        """
         self.model.train()
 
         train_gen_losses = []
@@ -959,14 +907,23 @@ class TTraining(Trainer):
 
         val_loader = self._build_dataloader(self.data_val, num_workers=4)
 
+        # Exponential annealing rate: τ_t = max(tau_min, tau_start * exp(-rate * t))
+        if self.epochs > 1:
+            anneal_rate = math.log(self.tau_start / self.tau_min) / (self.epochs - 1)
+        else:
+            anneal_rate = 0.0
+
         for epoch in tqdm(range(self.epochs)):
             self.model.train()
             train_loader = self._build_dataloader(self.data_train, num_workers=4)
 
-            # Linear annealing of teacher forcing (same schedule as KTrainer)
+            # Exponential Gumbel-softmax temperature annealing (τ: 0.9 → ~0)
+            tau = max(self.tau_min, self.tau_start * math.exp(-anneal_rate * epoch))
+
+            # Linear teacher forcing annealing (same schedule as KTrainer)
             self.teacher_forcing_ratio = max(
                 self.min_teacher_forcing_value,
-                self.max_teacher_forcing_value - epoch / max(1, (self.epochs * 0.5)),
+                self.max_teacher_forcing_value - epoch / max(1, self.epochs * 0.5),
             )
 
             gen_loss_total = 0.0
@@ -975,72 +932,71 @@ class TTraining(Trainer):
 
             for i, batch in enumerate(train_loader):
                 prefixes, target_suffix_act, eos_suffix = self._unpack_batch(batch)
-                batch_size = target_suffix_act.shape[0]
-                disc_loss = torch.tensor(0.0, device=self.device)
 
                 if self.use_gan:
-                    # ---- Discriminator step (Taymouri et al.) ----
-                    # Gumbel-softmax on real suffix one-hot
-                    real_onehot = F.one_hot(target_suffix_act, self.model.output_size_act).float()
-                    real_gumbel = F.gumbel_softmax(real_onehot, tau=max(0.01, 0.9 ** epoch), dim=-1)
+                    # ==========================================================
+                    # Discriminator step (Algorithm 1, line 4):
+                    # L(D;G) = -log(D(σ>k)) - log(1 - D(σ̂>k))
+                    # ==========================================================
 
-                    # Generator prediction with Gumbel-softmax
+                    # Real suffix: Gumbel-softmax continuous approximation
+                    real_onehot = F.one_hot(target_suffix_act, self.model.output_size_act).float()
+                    real_gumbel = F.gumbel_softmax(real_onehot, tau=tau, hard=False, dim=-1)
+
+                    # Fake suffix: generator output with Gumbel-softmax (detached from G)
                     with torch.no_grad():
-                        logits_for_d = self.model(
+                        logits_d = self.model(
                             prefixes=prefixes,
                             target_suffix=target_suffix_act,
                             teacher_forcing_ratio=self.teacher_forcing_ratio,
-                        )
-                    fake_gumbel = F.gumbel_softmax(
-                        logits_for_d.permute(1, 0, 2).detach(),
-                        tau=max(0.01, 0.9 ** epoch),
-                        dim=-1,
-                    )
+                        )  # [S, B, C]
+                    fake_gumbel_d = F.gumbel_softmax(
+                        logits_d.permute(1, 0, 2).detach(), tau=tau, hard=False, dim=-1,
+                    )  # [B, S, C]
 
-                    # Discriminator predictions
-                    pr = self.model.discriminator(real_gumbel)  # [B, S, 1]
-                    pf = self.model.discriminator(fake_gumbel)  # [B, S, 1]
+                    # Discriminator predictions (raw logits before sigmoid)
+                    d_real = self.model.discriminator(real_gumbel)   # [B, S, 1]
+                    d_fake = self.model.discriminator(fake_gumbel_d) # [B, S, 1]
 
-                    disc_loss = -torch.mean(F.logsigmoid(pr)) - torch.mean(F.logsigmoid(1.0 - pf))
+                    # L(D;G) = -log(D(σ>k)) - log(1 - D(σ̂>k))
+                    disc_loss = -torch.mean(F.logsigmoid(d_real)) - torch.mean(F.logsigmoid(-d_fake))
 
                     self.discriminator_optimizer.zero_grad()
                     disc_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        list(self.model.discriminator_lstm.parameters()) + list(self.model.discriminator_head.parameters()),
-                        max_norm=1.0,
-                    )
+                    torch.nn.utils.clip_grad_norm_(self.model.discriminator.parameters(), max_norm=1.0)
                     self.discriminator_optimizer.step()
+                else:
+                    disc_loss = torch.tensor(0.0, device=self.device)
 
-                    # ---- Generator adversarial step ----
-                    logits_g = self.model(
-                        prefixes=prefixes,
-                        target_suffix=target_suffix_act,
-                        teacher_forcing_ratio=self.teacher_forcing_ratio,
-                    )
-                    fake_gumbel_g = F.gumbel_softmax(
-                        logits_g.permute(1, 0, 2),
-                        tau=max(0.01, 0.9 ** epoch),
-                        dim=-1,
-                    )
-                    pf_g = self.model.discriminator(fake_gumbel_g)
-                    adv_loss_g = -torch.mean(F.logsigmoid(pf_g) - F.logsigmoid(1.0 - pf_g))
-                    adv_loss_g.backward(retain_graph=True)
+                # ==========================================================
+                # Generator step (Algorithm 1, line 5):
+                # Update θg by minimizing L(G;D) + L_supervised
+                # ==========================================================
+                self.generator_optimizer.zero_grad()
 
-                # ---- MLE step (shared for both GAN and MLE modes) ----
-                logits = self.model(
+                # Single forward pass for both losses
+                logits_g = self.model(
                     prefixes=prefixes,
                     target_suffix=target_suffix_act,
                     teacher_forcing_ratio=self.teacher_forcing_ratio,
-                )
-                loss_ce = self._masked_activity_loss(logits, target_suffix_act, eos_mask=eos_suffix)
+                )  # [S, B, C]
 
-                gen_loss = loss_ce
+                # L_supervised: standard cross-entropy on activity suffixes
+                loss_supervised = self._masked_activity_loss(logits_g, target_suffix_act, eos_mask=eos_suffix)
+
                 if self.use_gan:
-                    gen_loss = loss_ce  # adversarial gradient already accumulated via retain_graph
+                    # L(G;D) = -[log(D(σ̂>k)) - log(1 - D(σ̂>k))]
+                    fake_gumbel_g = F.gumbel_softmax(
+                        logits_g.permute(1, 0, 2), tau=tau, hard=False, dim=-1,
+                    )  # [B, S, C]
+                    d_fake_g = self.model.discriminator(fake_gumbel_g)  # [B, S, 1]
+                    adv_loss = -torch.mean(F.logsigmoid(d_fake_g) - F.logsigmoid(-d_fake_g))
+                    gen_loss = adv_loss + loss_supervised
+                else:
+                    gen_loss = loss_supervised
 
-                self.generator_optimizer.zero_grad()
                 gen_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.seq2seq.parameters(), max_norm=1.0)
                 self.generator_optimizer.step()
 
                 gen_loss_total += gen_loss.item()
@@ -1053,15 +1009,15 @@ class TTraining(Trainer):
             train_disc_losses.append(epoch_disc_loss)
 
             # Validation
-            val_loss, val_acc = self._validate_with_beam(val_loader)
+            val_loss, val_acc = self._validate(val_loader)
             val_losses.append(val_loss)
             val_beam_token_acc.append(val_acc)
 
             # Logging
             current_lr = self._current_lr()
             tqdm.write(
-                f"Epoch [{epoch+1}/{self.epochs}] - Mode: {'GAN' if self.use_gan else 'MLE'}, "
-                f"LR: {current_lr}, TF: {self.teacher_forcing_ratio:.4f}, "
+                f"Epoch [{epoch+1}/{self.epochs}], LR: {current_lr}, "
+                f"τ: {tau:.4f}, TF: {self.teacher_forcing_ratio:.4f}, "
                 f"Gen Loss: {epoch_gen_loss:.4f}, Disc Loss: {epoch_disc_loss:.4f}, "
                 f"Val Loss: {val_loss:.4f}, Beam Acc: {val_acc:.4f}"
             )
@@ -1080,14 +1036,12 @@ class TTraining(Trainer):
 
         return train_gen_losses, train_disc_losses, val_losses, val_beam_token_acc
 
-    # -- validation ----------------------------------------------------------
-
-    def _validate_with_beam(self, loader):
+    def _validate(self, loader):
         """Validate using CE loss and beam-search token accuracy."""
         self.model.eval()
         val_loss_total = 0.0
-        token_correct = 0.0
-        token_total = 0.0
+        token_correct = 0
+        token_total = 0
         n_batches = 0
 
         with torch.no_grad():
@@ -1097,23 +1051,22 @@ class TTraining(Trainer):
                 logits = self.model(prefixes=prefixes, target_suffix=target_suffix_act, teacher_forcing_ratio=0.0)
                 loss = self._masked_activity_loss(logits, target_suffix_act, eos_mask=eos_suffix)
 
+                # Beam-search decoding for token accuracy
                 decoded = self.model.beam_search(
                     prefixes=prefixes,
                     beam_width=self.beam_width,
                     max_len=target_suffix_act.shape[1],
                     eos_id=self.eos_id,
                 )
-
-                # Use best beam (index 0) for token accuracy
                 decoded_best = decoded[:, 0, :]  # [B, max_len]
 
-                if eos_suffix is None:
+                if eos_suffix is not None:
+                    valid_mask = eos_suffix.bool()
+                    token_correct += ((decoded_best == target_suffix_act) & valid_mask).sum().item()
+                    token_total += valid_mask.sum().item()
+                else:
                     token_correct += (decoded_best == target_suffix_act).sum().item()
                     token_total += target_suffix_act.numel()
-                else:
-                    valid = eos_suffix.bool()
-                    token_correct += ((decoded_best == target_suffix_act) & valid).sum().item()
-                    token_total += valid.sum().item()
 
                 val_loss_total += loss.item()
                 n_batches += 1
@@ -1121,5 +1074,5 @@ class TTraining(Trainer):
         self.model.train()
 
         mean_val_loss = val_loss_total / max(1, n_batches)
-        beam_token_acc = token_correct / max(1.0, token_total)
-        return mean_val_loss, beam_token_acc
+        mean_accuracy = token_correct / max(1, token_total)
+        return mean_val_loss, mean_accuracy

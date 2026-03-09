@@ -21,11 +21,11 @@ import numpy as np
 import pandas as pd
 from pm4py.visualization.petri_net import visualizer as pn_vis
 
-from decision_mining.custom_framework.function_estimator_DT_basic import FunctionEstimator as fe_basic
-from decision_mining.custom_framework.function_estimator_catboost_advanced import FunctionEstimator as fe_advanced
+from decision_mining.function_estimator_DT_basic import FunctionEstimator as fe_basic
+from decision_mining.function_estimator_catboost_advanced import FunctionEstimator as fe_advanced
 
-from decision_mining.custom_framework.function_estimator_DT_basic import ModelConfig as mc_basic
-from decision_mining.custom_framework.function_estimator_catboost_advanced import ModelConfig as mc_advanced
+from decision_mining.function_estimator_DT_basic import ModelConfig as mc_basic
+from decision_mining.function_estimator_catboost_advanced import ModelConfig as mc_advanced
 
 @dataclass
 class DecisionPointModel:
