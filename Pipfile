@@ -16,6 +16,7 @@ crps = "*"
 pyxdameraulevenshtein = "*"
 standard-imghdr = "*"
 python-levenshtein = "*"
+catboost = "*"
 
 [dev-packages]
 

@@ -148,7 +148,7 @@ def _detect_categorical_columns(X: pd.DataFrame, treat_int_as_categorical: bool)
             cat_cols.append(c)
             continue
         # pandas "category" dtype should be treated as categorical
-        if pd.api.types.is_categorical_dtype(s.dtype):
+        if isinstance(s.dtype, pd.CategoricalDtype):
             cat_cols.append(c)
             continue
         if pd.api.types.is_object_dtype(s.dtype) or pd.api.types.is_string_dtype(s.dtype):

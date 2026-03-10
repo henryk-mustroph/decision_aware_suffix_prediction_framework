@@ -260,6 +260,7 @@ class DecisionDiscovery:
             def _as_num(v: Any) -> Any:
                 if isinstance(v, (float, np.floating)):
                     return v
+                return np.nan
 
             getv = _as_num if is_continuous else _as_cat
 
@@ -310,7 +311,7 @@ class DecisionDiscovery:
             elif method == 'advanced':
                 est = fe_advanced.fit_from_xy(X_raw, labels, feature_cols=None, model_cfg=mc_config or mc_advanced())
             else:
-                raise ValueError('Only baisc and advanced exist!')
+                raise ValueError('Only basic and advanced exist!')
 
             models[place_name] = DecisionPointModel(place_name=place_name, estimator=est)
 

@@ -28,7 +28,7 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
         seq_len_pred: int,
         hidden_size: int,
         num_layers: int,
-        dropout: Optional[float] = None,
+        dropout: float,
         # optional static attributes
         static_data_set_categories: Optional[list[tuple[str, dict[str, int]]]] = None,
         static_enc_feat: Optional[list] = None):
@@ -42,7 +42,7 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
         - seq_len_pred: Length of the predicted suffix sequence
         - hidden_size: Hidden size for LSTM cells and fully connected layers
         - num_layers: Number of hidden layers in both Encoder and Decoder
-        - dropout: Dropout probability
+        - dropout (float): Dropout probability, must be in [0, 1). Required.
         - static_data_set_categories: Event attribute categories for static encoder input
         - static_enc_feat: Static event attributes used by encoder as input
         """
@@ -654,7 +654,7 @@ class DropoutUncertaintyLSTMDecoder(nn.Module):
                  embeddings,
                  data_indices_dec,
                  num_layers: int,
-                 dropout: Optional[float] = None):
+                 dropout: float):
         """
         Decoder part of the Encoder-Decoder LSTM.
 
@@ -665,7 +665,7 @@ class DropoutUncertaintyLSTMDecoder(nn.Module):
         - embeddings: Categorical event attributes embeddings
         - data_indices_dec: Indices of event attributes
         - num_layers (int): Number of hidden layers in the LSTM
-        - dropout (Optional[float]): Dropout probability
+        - dropout (float): Dropout probability, must be in [0, 1). Required.
         """
         super(DropoutUncertaintyLSTMDecoder, self).__init__()
 
@@ -862,7 +862,7 @@ class DropoutUncertaintyLSTMEncoder(nn.Module):
                  static_data_indices: Optional[List[List[int]]] = None,
                  static_input_size: Optional[int] = 0,
                  # mc-dropout
-                 dropout: Optional[float] = None):
+                 dropout: float = 0.0):
         """
         Encoder part of the Encoder-Decoder LSTM.
 
@@ -875,7 +875,7 @@ class DropoutUncertaintyLSTMEncoder(nn.Module):
         - static_embeddings (Optional[nn.ModuleList]): Embedding modules for static categorical inputs.
         - static_data_indices (Optional[List[List[int]]]): Indices selecting static categorical and numerical tensors.
         - static_input_size (Optional[int]): Flattened size of all static features after embeddings.
-        - dropout (Optional[float]): Dropout probability used for MC dropout in the LSTM cells.
+        - dropout (float): Dropout probability, must be in [0, 1). Required.
         """
         super(DropoutUncertaintyLSTMEncoder, self).__init__()
 
@@ -1103,30 +1103,26 @@ class DropoutUncertaintyLSTMCell(nn.Module):
     LSTM cell with MC Dropout for uncertainty estimation.
     """
 
-    def __init__(self, input_size: int, hidden_size: int, dropout: Optional[float] = None):
+    def __init__(self, input_size: int, hidden_size: int, dropout: float):
         """
         Initializes LSTM cell with MC Dropout.
 
         Args:
             input_size (int): Size of input features.
             hidden_size (int): Size of hidden layer.
-            dropout (Optional[float]): Dropout probability, should be between 0 and 1.
+            dropout (float): Dropout probability, must be in [0, 1).
         """
         super(DropoutUncertaintyLSTMCell, self).__init__()
 
         self.input_size = input_size
         self.hidden_size = hidden_size
 
-        # Initialize dropout
-        if dropout is None:
-            # Set p for dropout to random parameter
-            self.p_logit = nn.Parameter(torch.empty(1).normal_())
-        elif not 0 <= dropout < 1:
-            # p dropout must be between 0 and 1
-            raise Exception("Dropout rate should be between in [0, 1)")
-        else:
-            # Set p dropout to the fixed value
-            self.p_logit = dropout
+        # Validate and set fixed dropout probability
+        if not isinstance(dropout, (int, float)):
+            raise TypeError("Dropout rate must be a float, got: " + str(type(dropout)))
+        if not 0 <= dropout < 1:
+            raise ValueError("Dropout rate must be in [0, 1), got: " + str(dropout))
+        self.p_logit = float(dropout)
 
         # Input gate
         self.Wi = nn.Linear(self.input_size, self.hidden_size)
@@ -1187,11 +1183,7 @@ class DropoutUncertaintyLSTMCell(nn.Module):
         Note: value p_logit at infinity can cause numerical instability.
         Dropout masks for 4 gates, scale input by 1 / (1 - p)
         """
-        # Check dropout probability
-        if isinstance(self.p_logit, float):
-            p = self.p_logit
-        else:
-            p = torch.sigmoid(self.p_logit)
+        p = self.p_logit
 
         # Four Weight matrix pairs: Perform dropout for each weight layer.
         GATES = 4
@@ -1223,11 +1215,7 @@ class DropoutUncertaintyLSTMCell(nn.Module):
         """
         L2 regularization of weights and biases scaled for dropout.
         """
-        # Compute dropout probability
-        if isinstance(self.p_logit, float):
-            p = self.p_logit
-        else:
-            p = torch.sigmoid(self.p_logit)
+        p = self.p_logit
 
         # Weight L2 sum (keeps autograd).
         # For MC-dropout-as-variational-inference:
