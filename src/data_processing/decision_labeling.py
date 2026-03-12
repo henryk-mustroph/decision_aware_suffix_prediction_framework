@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from copy import deepcopy
+import importlib
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -55,6 +56,25 @@ def _compat_unpickle(f):
     return _CompatUnpickler(f).load()
 
 
+def _load_estimator_artifact(obj: Any) -> Any:
+    if not isinstance(obj, dict):
+        return obj
+    if obj.get("artifact_type") != "decision_mining_estimator":
+        return obj
+
+    module_name = str(obj.get("estimator_module", ""))
+    class_name = str(obj.get("estimator_class", "FunctionEstimator"))
+    if not module_name:
+        return obj
+
+    module_name = _MODULE_RENAMES.get(module_name, module_name)
+    module = importlib.import_module(module_name)
+    cls = getattr(module, class_name)
+    if hasattr(cls, "from_artifact"):
+        return cls.from_artifact(obj)
+    return obj
+
+
 # Sentinel for non-decision events
 BOTTOM = "⊥"
 
@@ -63,41 +83,53 @@ def _resolve_nu(
     transition: Any,
     net: Any,
     *,
-    _visited: Optional[set] = None,
-) -> Optional[Any]:
-    """Resolve ν(t): the first reachable non-silent transition after *transition*.
+    _visited: Optional[frozenset] = None,
+) -> set:
+    """Resolve ν(t): *all* first-reachable non-silent transitions after *transition*.
 
-    If *transition* itself is non-silent (has a label), return it directly.
-    Otherwise follow the unique path of silent transitions through the net.
-    Returns ``None`` if no non-silent transition is reachable.
+    If *transition* itself is non-silent (has a label), return ``{transition}``.
+    Otherwise follow silent transitions through the net, branching at every
+    intermediate place (including decision places).
+
+    A frozenset copy of *_visited* is used per branch so that parallel paths
+    through a shared intermediate node are all explored, while cycles are
+    still detected and pruned.
+
+    Returns a set of visible (non-silent) transitions.
     """
     if _visited is None:
-        _visited = set()
+        _visited = frozenset()
 
     if transition in _visited:
-        return None
-    _visited.add(transition)
+        return set()
+    _visited = _visited | {transition}
 
     if getattr(transition, "label", None) is not None:
-        return transition
+        return {transition}
 
-    # transition is silent – follow its output places
+    # transition is silent – follow its output places (branch at each)
+    results: set = set()
     for out_arc in transition.out_arcs:
         place = out_arc.target
         for place_out_arc in place.out_arcs:
             next_trans = place_out_arc.target
-            result = _resolve_nu(next_trans, net, _visited=_visited)
-            if result is not None:
-                return result
-    return None
+            results |= _resolve_nu(next_trans, net, _visited=_visited)
+    return results
 
 
 def _build_nu_mapping(
     decision_place: Any,
     net: Any,
-) -> Dict[Any, Optional[Any]]:
-    """Build {outgoing_transition: ν(outgoing_transition)} for a decision place."""
-    mapping: Dict[Any, Optional[Any]] = {}
+) -> Dict[Any, set]:
+    """Build {outgoing_transition: set-of-ν-transitions} for a decision place.
+
+    Each outgoing transition is mapped to the set of all first-reachable
+    visible transitions.  For a non-silent outgoing transition the set
+    contains just itself.  For a silent one the set may contain many
+    visible transitions (reachable through intermediate silent/decision
+    structures).
+    """
+    mapping: Dict[Any, set] = {}
     for arc in decision_place.out_arcs:
         t = arc.target
         mapping[t] = _resolve_nu(t, net)
@@ -106,25 +138,41 @@ def _build_nu_mapping(
 
 def _build_soft_distribution(
     transition_probs: Dict[str, float],
-    nu_mapping: Dict[Any, Optional[Any]],
+    nu_mapping: Dict[Any, set],
     transition_by_name: Dict[str, Any],
 ) -> Dict[str, float]:
     """Convert decision-model transition probabilities to event-label probabilities.
 
-    Uses the ν-mapping to aggregate probability mass of silent transitions onto
-    the first reachable non-silent transition's label.
+    Uses the ν-mapping to distribute each outgoing transition's predicted
+    probability mass uniformly across its reachable visible event labels.
 
     Returns a dict {event_label: probability} (normalised to sum to 1).
     """
     label_mass: Dict[str, float] = defaultdict(float)
     total_defined = 0.0
 
-    for trans_obj, nu_trans in nu_mapping.items():
+    for trans_obj, nu_set in nu_mapping.items():
         trans_name = str(trans_obj.name)
         prob = transition_probs.get(trans_name, 0.0)
-        if nu_trans is not None and getattr(nu_trans, "label", None) is not None:
-            label_mass[str(nu_trans.label)] += prob
-            total_defined += prob
+        if not nu_set or prob <= 0.0:
+            continue
+
+        # Collect unique visible labels reachable from this transition
+        visible_labels: set = set()
+        for nu_trans in nu_set:
+            lbl = getattr(nu_trans, "label", None)
+            if lbl is not None:
+                visible_labels.add(str(lbl))
+
+        if not visible_labels:
+            continue
+
+        # Distribute this transition's probability uniformly across its
+        # reachable visible labels
+        share = prob / len(visible_labels)
+        for lbl in visible_labels:
+            label_mass[lbl] += share
+        total_defined += prob
 
     if total_defined <= 0.0:
         return {}
@@ -186,7 +234,7 @@ class DecisionLabeler:
         }
 
         # nu-mappings per decision place
-        self.nu_mappings: Dict[str, Dict[Any, Optional[Any]]] = {}
+        self.nu_mappings: Dict[str, Dict[Any, set]] = {}
         for p in self.decision_places:
             self.nu_mappings[str(p)] = _build_nu_mapping(p, self.net)
 
@@ -206,8 +254,11 @@ class DecisionLabeler:
             # active when the mining notebook ran – not to the bundle file.
             model_filename = Path(model_path_str).name
             candidate = model_dir / model_filename
+            candidate_sub = model_dir / "models" / model_filename
             if candidate.exists():
                 model_path = candidate
+            elif candidate_sub.exists():
+                model_path = candidate_sub
             else:
                 model_path = Path(model_path_str)
                 if not model_path.is_absolute():
@@ -216,7 +267,37 @@ class DecisionLabeler:
                     )
             if model_path.exists():
                 with open(model_path, "rb") as f:
-                    self.estimators[place_name] = _compat_unpickle(f)
+                    loaded = _compat_unpickle(f)
+                    self.estimators[place_name] = _load_estimator_artifact(loaded)
+
+        # Build UUID remapping: model-transition-name → net-transition-name.
+        # The Inductive Miner assigns random UUIDs to visible transitions on
+        # every run, so models trained on one net use different UUIDs than
+        # the net in *petri_net*.  Silent transitions (skip_X, init_loop_X)
+        # get deterministic names and are fine.  For visible transitions we
+        # match by elimination: if N model names are unmatched and N net
+        # names are unmatched (all visible), pair them 1-to-1.
+        self._transition_remap: Dict[str, Dict[str, str]] = {}  # place -> {model_name: net_name}
+        for place_name, estimator in self.estimators.items():
+            place = self.decision_place_by_name.get(place_name)
+            if place is None:
+                continue
+            net_names = {str(a.target.name) for a in place.out_arcs}
+            model_names = set(estimator.label_encoder.classes_)
+            unmatched_model = sorted(model_names - net_names)
+            unmatched_net = sorted(net_names - model_names)
+            if len(unmatched_model) == len(unmatched_net) == 1:
+                self._transition_remap[place_name] = {
+                    unmatched_model[0]: unmatched_net[0]
+                }
+            elif len(unmatched_model) > 1 and len(unmatched_model) == len(unmatched_net):
+                # Multiple visible transitions – log a warning but cannot
+                # disambiguate without the original training net labels.
+                import warnings
+                warnings.warn(
+                    f"Decision place {place_name}: {len(unmatched_model)} "
+                    f"unmatched model→net UUIDs; cannot auto-remap."
+                )
 
     # ------------------------------------------------------------------
     # Feature-row building (mirrors DecisionDiscovery._build_feature_row
@@ -330,24 +411,208 @@ class DecisionLabeler:
         self,
         place_name: str,
         past_events: List[Dict[str, Any]],
+        _visited_places: Optional[frozenset] = None,
     ) -> Dict[str, float]:
         """Query the decision model at *place_name* and return a soft
-        next-event-label distribution z_i(a)."""
+        next-event-label distribution z_i(a).
+
+        Uses **recursive model composition**: when a silent outgoing
+        transition leads to another decision place that also has a trained
+        model, that model is queried and the resulting sub-distribution is
+        composed with the current transition probability.  This avoids the
+        uniform-dilution problem that occurs when naïvely distributing mass
+        across *all* reachable visible labels.
+        """
+        if _visited_places is None:
+            _visited_places = frozenset()
+        if place_name in _visited_places:
+            return {}
+        _visited_places = _visited_places | {place_name}
+
         estimator = self.estimators.get(place_name)
         if estimator is None:
             return {}
 
         feature_row = self._build_feature_row(past_events)
         transition_labels, probs = estimator.predict_proba(feature_row)
-        transition_probs = dict(zip(transition_labels, probs.tolist()))
 
-        nu_map = self.nu_mappings.get(place_name, {})
-        if not nu_map:
+        # Remap model UUIDs to net UUIDs for visible transitions
+        remap = self._transition_remap.get(place_name, {})
+        transition_probs = {
+            remap.get(lbl, lbl): p
+            for lbl, p in zip(transition_labels, probs.tolist())
+        }
+
+        place = self.decision_place_by_name.get(place_name)
+        if place is None:
             return {}
 
-        return _build_soft_distribution(
-            transition_probs, nu_map, self.transition_by_name
-        )
+        label_mass: Dict[str, float] = defaultdict(float)
+        total = 0.0
+
+        for arc in place.out_arcs:
+            trans = arc.target
+            trans_name = str(trans.name)
+            prob = transition_probs.get(trans_name, 0.0)
+            if prob <= 0.0:
+                continue
+
+            sub_dist = self._follow_transition(
+                trans, past_events, _visited_places
+            )
+            for lbl, sub_p in sub_dist.items():
+                label_mass[lbl] += prob * sub_p
+            total += prob
+
+        if total <= 0.0:
+            return {}
+        return {lbl: mass / total for lbl, mass in label_mass.items()}
+
+    def _follow_transition(
+        self,
+        trans: Any,
+        past_events: List[Dict[str, Any]],
+        visited_places: frozenset,
+        _visited_trans: Optional[frozenset] = None,
+    ) -> Dict[str, float]:
+        """Follow *trans* and return a distribution over visible event labels.
+
+        * Visible transition → ``{label: 1.0}``
+        * Silent transition → follow output places:
+          - Decision place with a model → recursively predict via the model
+          - Non-decision place → follow its single outgoing transition
+          - Parallel split (multiple output places) → average branches
+        """
+        if _visited_trans is None:
+            _visited_trans = frozenset()
+        if trans in _visited_trans:
+            return {}
+        _visited_trans = _visited_trans | {trans}
+
+        # Visible transition – trivially maps to its label
+        if trans.label is not None:
+            return {str(trans.label): 1.0}
+
+        # Silent transition – collect distributions from output places
+        combined: Dict[str, float] = defaultdict(float)
+        n_branches = 0
+
+        for out_arc in trans.out_arcs:
+            place = out_arc.target
+            pname = str(place)
+
+            if pname in self.decision_place_names:
+                # Another decision place → use its model recursively
+                sub = self._predict_at_place(
+                    pname, past_events, visited_places
+                )
+                if sub:
+                    for lbl, p in sub.items():
+                        combined[lbl] += p
+                    n_branches += 1
+            else:
+                # Non-decision place → follow its outgoing transitions
+                for pa in place.out_arcs:
+                    sub = self._follow_transition(
+                        pa.target, past_events, visited_places, _visited_trans
+                    )
+                    if sub:
+                        for lbl, p in sub.items():
+                            combined[lbl] += p
+                        n_branches += 1
+
+        if n_branches <= 0:
+            return {}
+        # Average across parallel branches (tau-splits)
+        return {lbl: mass / n_branches for lbl, mass in combined.items()}
+
+    # ------------------------------------------------------------------
+    # Shallow (proximate) prediction: stops at downstream decision places
+    # ------------------------------------------------------------------
+
+    def _predict_shallow(
+        self,
+        place_name: str,
+        past_events: List[Dict[str, Any]],
+    ) -> Tuple[Dict[str, float], float]:
+        """Predict next visible activity at *place_name*.
+
+        The decision models are trained to predict next visible activity
+        directly (not outgoing transitions), so the model output is
+        already in the activity label space.  No ν-mapping or transition-
+        following is needed.
+
+        Returns ``(activity_dist, deferred_mass)``:
+
+        * *activity_dist*: ``{activity_label: probability}``
+        * *deferred_mass*: ``0.0`` (always resolved; ``1.0`` only when
+          no model exists for this place).
+        """
+        estimator = self.estimators.get(place_name)
+        if estimator is None:
+            return {}, 1.0
+
+        feature_row = self._build_feature_row(past_events)
+        labels, probs = estimator.predict_proba(feature_row)
+
+        dist = {
+            lbl: float(p)
+            for lbl, p in zip(labels, probs.flatten())
+            if p > 0
+        }
+        if not dist:
+            return {}, 1.0
+        return dist, 0.0
+
+    def _follow_transition_shallow(
+        self,
+        trans: Any,
+        _visited: Optional[frozenset] = None,
+    ) -> Tuple[Dict[str, float], float]:
+        """Follow *trans* shallowly — stop at decision places.
+
+        Returns ``(label_dist, deferred_fraction)``.
+
+        * Visible transition → ``({label: 1.0}, 0.0)``.
+        * Silent → decision place: ``({}, 1.0)`` — entirely deferred.
+        * Silent → non-decision place: keep following outgoing transitions.
+        """
+        if _visited is None:
+            _visited = frozenset()
+        if trans in _visited:
+            return {}, 0.0
+        _visited = _visited | {trans}
+
+        if trans.label is not None:
+            return {str(trans.label): 1.0}, 0.0
+
+        # Silent transition
+        combined: Dict[str, float] = defaultdict(float)
+        total_deferred = 0.0
+        n_branches = 0
+
+        for out_arc in trans.out_arcs:
+            place = out_arc.target
+            pname = str(place)
+
+            if pname in self.decision_place_names:
+                # Stop: this mass is deferred to a downstream decision
+                total_deferred += 1.0
+                n_branches += 1
+            else:
+                for pa in place.out_arcs:
+                    sub_dist, sub_def = self._follow_transition_shallow(
+                        pa.target, _visited
+                    )
+                    for lbl, p in sub_dist.items():
+                        combined[lbl] += p
+                    total_deferred += sub_def
+                    n_branches += 1
+
+        if n_branches <= 0:
+            return {}, 0.0
+        resolved = {lbl: mass / n_branches for lbl, mass in combined.items()}
+        return resolved, total_deferred / n_branches
 
     # ------------------------------------------------------------------
     # Offline labeling (training): uses optimal alignments
@@ -367,13 +632,27 @@ class DecisionLabeler:
         sorted_case_ids: List[str],
         alignments: List[Any],
     ) -> Dict[str, List[List[Tuple[str, Dict[str, float]]]]]:
-        """Label every event in every trace using optimal alignments.
+        """Label every event from the **first** decision place in t•.
+
+        For each visible event e_i, we inspect the output places of its
+        aligned transition t.  If any place p in t• is a decision point
+        (|p•| > 1), we query the shallow decision model at p using the
+        data state up to and including e_i.
+
+        This labeling depends only on e_i and the process structure — not
+        on e_{i+1} — so it is identical during training and inference
+        and does not leak future information.
+
+        The shallow prediction returns a resolved distribution z_i over
+        directly reachable visible event labels, and a deferred mass
+        representing probability flowing into downstream decision places.
 
         Returns
         -------
         dict  {case_id: list-of-event-labels}
-            Each event label is ``(place_name, z_i)`` for a decision event,
-            or ``(BOTTOM, {})`` for a non-decision event.
+            Each event label is
+            ``(place_name, z_i, deferred_mass)`` for a decision event, or
+            ``(BOTTOM, {}, 0.0)`` for a non-decision event.
             The list has one entry per *synchronized* (visible) event.
         """
         # Pre-compute elapsed times the same way DecisionDiscovery does.
@@ -395,69 +674,46 @@ class DecisionLabeler:
             event_labels: List[Tuple[str, Dict[str, float]]] = []
 
             for (log_name, model_name), (log_label, model_label) in case_alignment:
-                is_sync = (log_name != ">>") and (model_name != ">>")
-                is_model_move = (log_name == ">>") and (model_name != ">>")
-
                 if model_name == ">>":
-                    # log-only move — no model transition fired
-                    continue
+                    continue  # log-only move
 
                 trans = self.transition_by_name.get(model_name)
                 if trans is None:
                     continue
 
-                # Identify decision places in t•
-                decision_out_places = self._places_after_transition(trans)
+                is_sync = (log_name != ">>") and (model_name != ">>")
 
-                # Record label for synchronized (visible) events only
                 if is_sync:
-                    if decision_out_places:
-                        # Select the one decision place (structured nets have
-                        # at most one). If multiple exist pick the first.
-                        dp = decision_out_places[0]
-                        place_name = str(dp)
+                    # Match event in the log
+                    candidate_labels = [
+                        lbl for lbl in [log_label, model_label] if lbl
+                    ]
+                    matched_event = None
+                    for pos in range(case_event_cursor, len(case)):
+                        if case.iloc[pos].get("concept:name", None) in candidate_labels:
+                            matched_event = case.iloc[pos]
+                            case_event_cursor = pos + 1
+                            break
 
-                        # Data state η_i includes the current event
-                        # (up to and including e_i). We build past_events
-                        # *after* appending the current event.
-                        candidate_labels = [
-                            lbl for lbl in [log_label, model_label] if lbl
-                        ]
-                        matched_event = None
-                        for pos in range(case_event_cursor, len(case)):
-                            if case.iloc[pos].get("concept:name", None) in candidate_labels:
-                                matched_event = case.iloc[pos]
-                                case_event_cursor = pos + 1
-                                break
+                    # Update data state with e_i
+                    if matched_event is not None:
+                        ev_dict = matched_event.to_dict()
+                        event_attrs = self._filter_attributes(ev_dict)
+                        past_events.append(event_attrs)
 
-                        if matched_event is not None:
-                            ev_dict = matched_event.to_dict()
-                            event_attrs = self._filter_attributes(ev_dict)
-                            past_events.append(event_attrs)
-
-                        z_i = self._predict_at_place(place_name, past_events)
-                        event_labels.append((place_name, z_i))
+                    # Inspect t• for decision places
+                    dps = self._places_after_transition(trans)
+                    if dps:
+                        # In structured nets from Inductive Miner, at most
+                        # one place in t• is a decision place.
+                        dp = dps[0]
+                        dp_name = str(dp)
+                        z_i, deferred = self._predict_shallow(
+                            dp_name, past_events
+                        )
+                        event_labels.append((dp_name, z_i, deferred))
                     else:
-                        # Non-decision event — still advance the log cursor
-                        candidate_labels = [
-                            lbl for lbl in [log_label, model_label] if lbl
-                        ]
-                        matched_event = None
-                        for pos in range(case_event_cursor, len(case)):
-                            if case.iloc[pos].get("concept:name", None) in candidate_labels:
-                                matched_event = case.iloc[pos]
-                                case_event_cursor = pos + 1
-                                break
-
-                        if matched_event is not None:
-                            ev_dict = matched_event.to_dict()
-                            event_attrs = self._filter_attributes(ev_dict)
-                            past_events.append(event_attrs)
-
-                        event_labels.append((BOTTOM, {}))
-                elif is_model_move:
-                    # Silent/model-only move — no visible event, don't append a label
-                    pass
+                        event_labels.append((BOTTOM, {}, 0.0))
 
             result[case_id] = event_labels
 
@@ -474,27 +730,28 @@ class DecisionLabeler:
     ) -> List[Tuple[str, Dict[str, float]]]:
         """Label a single prefix using token-based replay.
 
-        Parameters
-        ----------
-        prefix_activities : list[str]
-            Sequence of activity labels (event labels) in the prefix.
-        prefix_event_data : list[dict] | None
-            One dict per event with the raw attribute values. If ``None``,
-            only structural (count-based) features are available.
+        For each event e_i we replay the prefix up to (and including) e_i
+        and inspect the reached marking for decision places.  If at least
+        one decision place is present, we query the shallow decision model
+        at that place.
+
+        This mirrors the offline labeling: we inspect t• (the output
+        places of the transition that fired e_i) which appear as marked
+        places in the marking after replaying up to e_i.
 
         Returns
         -------
-        list of (place_name | BOTTOM, z_i | {})
+        list of (place_name | BOTTOM, z_i | {}, deferred_mass | 0.0)
         """
         labels: List[Tuple[str, Dict[str, float]]] = []
         past_events: List[Dict[str, Any]] = []
 
-        # Replay incrementally: after each event, check if the reached marking
-        # contains a decision place.
-        for event_idx, activity in enumerate(prefix_activities):
-            # Replay the prefix up to (and including) this event
+        # Pre-compute per-event markings via incremental replay
+        markings: List[Marking] = []
+        for event_idx in range(len(prefix_activities)):
             trace_so_far = Trace(
-                [Event({"concept:name": act}) for act in prefix_activities[: event_idx + 1]]
+                [Event({"concept:name": act})
+                 for act in prefix_activities[: event_idx + 1]]
             )
             replayed = token_replay.apply(
                 log=[trace_so_far],
@@ -502,25 +759,32 @@ class DecisionLabeler:
                 initial_marking=self.im,
                 final_marking=Marking(),
             )
-            reached_marking = replayed[0]["reached_marking"]
+            markings.append(replayed[0]["reached_marking"])
 
-            # Update data state
+        def _decision_places_in_marking(marking: Marking) -> List[str]:
+            return [
+                str(p) for p in marking
+                if str(p) in self.decision_place_names
+            ]
+
+        for event_idx, activity in enumerate(prefix_activities):
+            # Update data state with e_i
             if prefix_event_data is not None and event_idx < len(prefix_event_data):
                 event_attrs = self._filter_attributes(prefix_event_data[event_idx])
                 past_events.append(event_attrs)
 
-            # Check if any marked place is a decision place
-            decision_place_name = None
-            for place in reached_marking:
-                if str(place) in self.decision_place_names:
-                    decision_place_name = str(place)
-                    break
+            # Use the marking after e_i — this contains t• for e_i's
+            # transition, i.e. the decision places reachable right after
+            # e_i fires.  No knowledge of e_{i+1} required.
+            dp_list = _decision_places_in_marking(markings[event_idx])
 
-            if decision_place_name is not None:
-                z_i = self._predict_at_place(decision_place_name, past_events)
-                labels.append((decision_place_name, z_i))
+            if dp_list:
+                # In structured nets, at most one place in t• is a dp.
+                dp_name = dp_list[0]
+                z_i, deferred = self._predict_shallow(dp_name, past_events)
+                labels.append((dp_name, z_i, deferred))
             else:
-                labels.append((BOTTOM, {}))
+                labels.append((BOTTOM, {}, 0.0))
 
         return labels
 
@@ -539,11 +803,11 @@ class DecisionLabeler:
 
         Calls ``dataset.set_decision_data()`` to populate decision labels
         in-place. Each position in a prefix gets a tuple
-        ``(activity_label, {next_event_label: probability})``.
+        ``(place_name, {next_event_label: probability}, deferred_mass)``.
 
-        For non-decision events the entry is ``(BOTTOM, {})``.
+        For non-decision events the entry is ``(BOTTOM, {}, 0.0)``.
         For events beyond the trace length (EOS padding), the entry is
-        ``(BOTTOM, {})``.
+        ``(BOTTOM, {}, 0.0)``.
         """
         # 1) Label full traces
         trace_labels = self.label_traces_offline(
@@ -571,7 +835,7 @@ class DecisionLabeler:
             for pos in range(prefix_len):
                 act = prefix_activities[pos] if pos < len(prefix_activities) else ""
                 if act == "EOS" or act == "":
-                    prefix_decision_labels.append((BOTTOM, {}))
+                    prefix_decision_labels.append((BOTTOM, {}, 0.0))
                     continue
 
                 # Find matching event in the trace labels
@@ -586,7 +850,7 @@ class DecisionLabeler:
                     break
 
                 if not matched:
-                    prefix_decision_labels.append((BOTTOM, {}))
+                    prefix_decision_labels.append((BOTTOM, {}, 0.0))
 
             decision_rows.append(prefix_decision_labels)
 
@@ -671,13 +935,13 @@ class DecisionLabeler:
             real_cursor = 0
             for act in prefix_activities:
                 if act == "EOS" or act == "":
-                    full_labels.append((BOTTOM, {}))
+                    full_labels.append((BOTTOM, {}, 0.0))
                 else:
                     if real_cursor < len(real_labels):
                         full_labels.append(real_labels[real_cursor])
                         real_cursor += 1
                     else:
-                        full_labels.append((BOTTOM, {}))
+                        full_labels.append((BOTTOM, {}, 0.0))
 
             decision_rows.append(full_labels)
 

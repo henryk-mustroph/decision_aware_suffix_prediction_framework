@@ -139,9 +139,24 @@ class DecisionDiscovery:
             ].reset_index(drop=True)
             case_event_cursor = 0
 
+            # Pre-compute the first visible activity at or after each
+            # alignment step (walking backwards).  This is the *next
+            # visible activity* that results from the decision — the
+            # label the decision model should learn to predict.
+            n_steps = len(case_alignment)
+            first_visible_at_or_after = [None] * n_steps
+            future_visible = None
+            for i in range(n_steps - 1, -1, -1):
+                (ln, mn), (ll, ml) = case_alignment[i]
+                if ln != ">>" and mn != ">>":
+                    label = ll or ml
+                    if label:
+                        future_visible = label
+                first_visible_at_or_after[i] = future_visible
+
             # past events through the case:
             past_events: List[Dict[str, Any]] = []
-            for (log_name, model_name), (log_label, model_label) in case_alignment:
+            for step_idx, ((log_name, model_name), (log_label, model_label)) in enumerate(case_alignment):
                 # if log move only, pass
                 if model_name != ">>":
                     # get tranistion:
@@ -153,10 +168,13 @@ class DecisionDiscovery:
                     decision_in_places = [p for p in in_places if p in self.decision_places]
 
                     # Add to training data:
-                    # if places is not None
+                    # Label = next visible activity (not transition name)
+                    nva = first_visible_at_or_after[step_idx]
+                    if nva is None:
+                        nva = "EOS"
                     for p in decision_in_places:
                         attrs = {"past_events": list(past_events)}
-                        I[p].append((attrs, model_name))
+                        I[p].append((attrs, nva))
                         legend[p].append(((log_name, model_name), (log_label, model_label)))
 
                     # Update history with synchronized events only.
@@ -347,7 +365,7 @@ class DecisionDiscovery:
                 labels.append(str(chosen))
 
             preview_df = pd.DataFrame(rows)
-            preview_df["target_transition"] = labels
+            preview_df["target_activity"] = labels
             previews[place_name] = preview_df
 
             if print_rows:
@@ -494,7 +512,8 @@ class DecisionDiscovery:
             estimator = None if model_obj is None else getattr(model_obj, "estimator", None)
             if estimator is not None:
                 with model_path.open("wb") as f:
-                    pickle.dump(estimator, f)
+                    artifact = estimator.to_artifact() if hasattr(estimator, "to_artifact") else estimator
+                    pickle.dump(artifact, f)
                 model_path_str = str(model_path)
             else:
                 model_path_str = ""
@@ -519,12 +538,12 @@ class DecisionDiscovery:
         # 2) Flat guard table for quick analysis
         flat_rows: List[Dict[str, Any]] = []
         for place_name, by_label in guards.items():
-            for transition_label, guard_list in by_label.items():
+            for activity_label, guard_list in by_label.items():
                 for g in guard_list:
                     flat_rows.append(
                         {
                             "place_name": str(place_name),
-                            "transition_label": str(transition_label),
+                            "activity_label": str(activity_label),
                             "rule": g.get("rule", ""),
                             "raw_rule": g.get("raw_rule", ""),
                             "prob": g.get("prob", np.nan),
@@ -564,12 +583,16 @@ class DecisionDiscovery:
         }
 
     def print_summary_and_visualize(self, guards: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> None:
-        """
-        Print a summary of the discovered guards and visualize the Petri net with guard annotations.
+        """Print a summary and visualize the Petri net with activity-level decision rules.
+
+        Guards are keyed by **activity label** (the next visible activity
+        the decision model predicts), not by outgoing transition name.
+        The visualization highlights each decision place in blue and
+        attaches a separate "note" box with a compact rule summary via
+        a dotted connector.
         """
 
         def _guard_prob(g: Dict[str, Any]) -> float:
-            # FunctionEstimator emits prob_model / prob_emp; older code used prob.
             if "prob_model" in g:
                 return float(g.get("prob_model", 0.0))
             if "prob" in g:
@@ -595,74 +618,127 @@ class DecisionDiscovery:
 
             rule = g.get("rule", "")
             raw_rule = g.get("raw_rule", "")
-
-            # Prefer the simplified rule; but if it collapsed to (true) while raw_rule had conditions,
-            # show raw_rule so you can see what was removed (often NaN-dummy splits).
             if rule and rule != "(true)":
                 parts.append("rule=" + rule)
-            else:
-                if raw_rule and raw_rule != "(true)":
-                    parts.append("raw_rule=" + raw_rule)
-
+            elif raw_rule and raw_rule != "(true)":
+                parts.append("raw_rule=" + raw_rule)
             return "; ".join(parts)
-        
-        def _best_guard_text(guard_list):
+
+        def _best_rule_for_activity(guard_list):
             if not guard_list:
                 return ""
-            # pick guard with highest probability (fallback to first)
             best = max(guard_list, key=_guard_prob)
             rule = best.get("rule", "")
             prob = _guard_prob(best)
             if rule and rule != "(true)":
-                return f"{rule} | p={prob:.2f}"
+                return f"{rule} (p={prob:.2f})"
             return f"p={prob:.2f}"
 
-        # Optional: exclude likely-silent transitions from printing.
-        # Adjust this regex to match your silent transition naming convention.
-        silent_label_rx = re.compile(r"^(skip_|tau|silent|>>)")
-
-        for place_name, by_label in guards.items():
-            print(f"\\n=== {place_name} ===")
-            if not by_label:
-                print("  (no guards emitted for this place)")
+        # --- Text summary ---
+        for place_name, by_activity in guards.items():
+            print(f"\n=== {place_name} ===")
+            if not by_activity:
+                print("  (no rules emitted for this place)")
                 continue
-
-            any_printed = False
-            for label, guard_list in by_label.items():
-                if silent_label_rx.search(str(label)):
-                    continue
-                any_printed = True
-                
-                # Use class label from transition object if available
-                trans_obj = self.transition_by_key.get(str(label))
-                display_label = trans_obj.label if trans_obj and hasattr(trans_obj, 'label') and trans_obj.label else str(label)
-                
-                print(f"- {display_label} ({len(guard_list)} guards)")
+            for activity_label, guard_list in by_activity.items():
+                print(f"  → {activity_label} ({len(guard_list)} rules)")
                 for g in guard_list:
-                    print("  *", _format_guard(g))
+                    print("    *", _format_guard(g))
 
-            if not any_printed:
-                print("  (all labels filtered as silent)")
+        # --- Petri net visualization ---
+        # Build compact annotation per decision place
+        place_annotations: Dict[str, str] = {}
+        for place_name, by_activity in guards.items():
+            lines = []
+            for activity_label, guard_list in by_activity.items():
+                summary = _best_rule_for_activity(guard_list)
+                lines.append(f"→{activity_label}: {summary}")
+            place_annotations[place_name] = "\n".join(lines)
 
-        # Visualize the Petri net with guard annotations
-
-        # Build a transition -> guard text map
-        transition_guard_text = {}
-        for place_name, by_label in guards.items():
-            for label, guard_list in by_label.items():
-                transition_guard_text[str(label)] = _best_guard_text(guard_list)
-
+        # Blue-highlight decision places (keep short label = place name only)
         decorations = {}
-        for t in self.net.transitions:
-            name = str(t.name)
-            guard_text = transition_guard_text.get(name, "")
-            
-            # Use class label for visualization display
-            base_label = t.label if hasattr(t, 'label') and t.label else name
-            
-            label_text = f"{base_label}\\n{guard_text}" if guard_text else base_label
-            decorations[t] = {"label": label_text}
+        place_id_map: Dict[str, str] = {}  # place_name → graphviz node id
+        for p in self.net.places:
+            pname = str(p)
+            place_id_map[pname] = str(id(p))
+            if pname in place_annotations:
+                decorations[p] = {"label": pname, "color": "#dce6f1"}
 
         params = {"decorations": decorations}
         gviz = pn_vis.apply(self.net, self.im, self.fm, parameters=params)
+
+        # Post-process: attach rule annotation boxes to decision places
+        for pname, annotation in place_annotations.items():
+            node_id = place_id_map.get(pname)
+            if not node_id:
+                continue
+            note_id = f"rule_{pname}"
+            gviz.node(note_id, label=annotation,
+                      shape="note", style="filled", fillcolor="#ffffcc",
+                      fontsize="9", fontname="Helvetica")
+            gviz.edge(note_id, node_id,
+                      style="dotted", arrowhead="none", constraint="false")
+
         pn_vis.view(gviz)
+
+    def visualize_bpmn_with_rules(self, guards: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> None:
+        """Convert the Petri net to BPMN and annotate tasks with decision-rule notes.
+
+        Each task that appears as a predicted activity in the decision
+        models gets a "note" box (yellow) attached via a dotted line,
+        showing which decision places predict it and with what
+        probability / rule.
+        """
+        from pm4py.objects.conversion.wf_net.variants import to_bpmn
+        from pm4py.objects.bpmn.obj import BPMN as BPMNObj
+        from pm4py.visualization.bpmn import visualizer as bpmn_vis
+
+        def _guard_prob(g: Dict[str, Any]) -> float:
+            if "prob_model" in g:
+                return float(g.get("prob_model", 0.0))
+            if "prob" in g:
+                return float(g.get("prob", 0.0))
+            return float(g.get("prob_emp", 0.0))
+
+        def _best_rule_for_activity(guard_list):
+            if not guard_list:
+                return ""
+            best = max(guard_list, key=_guard_prob)
+            rule = best.get("rule", "")
+            prob = _guard_prob(best)
+            if rule and rule != "(true)":
+                return f"{rule} (p={prob:.2f})"
+            return f"p={prob:.2f}"
+
+        bpmn_graph = to_bpmn.apply(self.net, self.im, self.fm)
+        gviz = bpmn_vis.apply(bpmn_graph)
+
+        # Invert guards: activity → list of (place_name, best_rule_summary)
+        activity_notes: Dict[str, list] = {}
+        for place_name, by_activity in guards.items():
+            for activity_label, guard_list in by_activity.items():
+                summary = _best_rule_for_activity(guard_list)
+                if summary:
+                    activity_notes.setdefault(activity_label, []).append(
+                        f"{place_name}: {summary}"
+                    )
+
+        # Find BPMN task node IDs in graphviz and attach annotations
+        task_gv_ids: Dict[str, str] = {}
+        for node in bpmn_graph.get_nodes():
+            if isinstance(node, BPMNObj.Task):
+                task_gv_ids[node.get_name()] = str(id(node))
+
+        for activity_label, notes in activity_notes.items():
+            gv_id = task_gv_ids.get(activity_label)
+            if not gv_id:
+                continue
+            annotation = "\n".join(notes)
+            note_id = f"rule_{activity_label.replace(' ', '_')}"
+            gviz.node(note_id, label=annotation,
+                      shape="note", style="filled", fillcolor="#ffffcc",
+                      fontsize="8", fontname="Helvetica")
+            gviz.edge(note_id, gv_id,
+                      style="dotted", arrowhead="none", constraint="false")
+
+        bpmn_vis.view(gviz)

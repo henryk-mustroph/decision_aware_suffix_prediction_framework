@@ -8,7 +8,7 @@ Decision Tree model training and decision guard mining (improved)
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import re
 import math
@@ -387,6 +387,39 @@ class FunctionEstimator:
         self._train_X_enc: Optional[pd.DataFrame] = None
         self._train_y_int: Optional[np.ndarray] = None
         self._priors: Dict[int, float] = {}
+
+    def to_artifact(self) -> Dict[str, Any]:
+        return {
+            "artifact_type": "decision_mining_estimator",
+            "artifact_version": 1,
+            "estimator_module": __name__,
+            "estimator_class": self.__class__.__name__,
+            "state": {
+                "model_cfg": asdict(self.model_cfg),
+                "encoder": asdict(self.encoder) if self.encoder is not None else None,
+                "label_encoder": self.label_encoder,
+                "class_int_to_label": self.class_int_to_label,
+                "clf": self.clf,
+                "_base_clf": self._base_clf,
+                "feature_names": self.feature_names,
+                "_train_X_enc": self._train_X_enc,
+                "_train_y_int": self._train_y_int,
+                "_priors": self._priors,
+            },
+        }
+
+    @classmethod
+    def from_artifact(cls, artifact: Dict[str, Any]) -> "FunctionEstimator":
+        state = dict(artifact.get("state", {}))
+        cfg_dict = state.pop("model_cfg", None) or {}
+        encoder_dict = state.pop("encoder", None)
+
+        obj = cls(model_cfg=ModelConfig(**cfg_dict))
+        if encoder_dict is not None:
+            obj.encoder = FeatureEncoder(**encoder_dict)
+        for key, value in state.items():
+            setattr(obj, key, value)
+        return obj
 
     @classmethod
     def fit_from_xy(

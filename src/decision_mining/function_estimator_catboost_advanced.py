@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import math
 import re
@@ -12,6 +12,7 @@ import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import average_precision_score, f1_score
 from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.tree import DecisionTreeClassifier
 from pandas.api.types import is_integer_dtype, is_float_dtype
@@ -53,12 +54,17 @@ class ModelConfig:
     model_type: str = "catboost"
     random_state: int = 7
 
-    # Base model hyperparams (CatBoost defaults are okay; tune if needed)
-    cb_iterations: int = 2000
+    # Base model hyperparams. Keep defaults modest and rely on early stopping.
+    cb_iterations: int = 600
     cb_learning_rate: float = 0.05
     cb_depth: int = 6
     cb_l2_leaf_reg: float = 3.0
     cb_loss: str = "Logloss"  # auto-switched to "MultiClass" if needed
+    cb_eval_fraction: float = 0.15
+    cb_early_stopping_rounds: int = 80
+    cb_use_best_model: bool = True
+    cb_thread_count: int = -1
+    cb_allow_writing_files: bool = False
 
     # Imbalance handling
     use_inverse_freq_weights: bool = True
@@ -73,15 +79,19 @@ class ModelConfig:
     # Surrogate tree (for guards)
     surrogate_max_depth: Optional[int] = 6
     surrogate_min_samples_leaf: int = 30
+    surrogate_target: str = "true_label"  # true_label | base_argmax
+    surrogate_top_k_features: Optional[int] = 20
     surrogate_tune_ccp_alpha: bool = True
-    surrogate_pruning_cv: int = 5
-    surrogate_pruning_max_alphas: int = 25
+    surrogate_pruning_cv: int = 3
+    surrogate_pruning_max_alphas: int = 12
     surrogate_pruning_metric: str = "auto"  # "auto" | "prauc" (binary) | "f1_macro" (multiclass)
 
-    # Probability calibration (base model)
-    calibrate: bool = True
+    # Probability calibration (base model). Disabled by default because
+    # CatBoost is usually calibrated enough for this use case, and CV
+    # calibration dominates runtime across many decision places.
+    calibrate: bool = False
     calibration_method: str = "sigmoid"
-    calibration_cv: int = 5
+    calibration_cv: int = 3
 
     # Guard extraction
     guard_ci: float = 0.95
@@ -358,14 +368,112 @@ class FunctionEstimator:
 
         # CatBoost helpers
         self._cb_cat_cols: List[str] = []
+        self.base_raw_feature_names: List[str] = []
 
         self.feature_names: List[str] = []
+        self.surrogate_raw_feature_names: List[str] = []
         self._priors: Dict[int, float] = {}
 
         self._train_X_raw: Optional[pd.DataFrame] = None
         self._train_X_enc: Optional[pd.DataFrame] = None
         self._train_y_int: Optional[np.ndarray] = None
         self._train_base_proba: Optional[np.ndarray] = None
+
+    def to_artifact(self) -> Dict[str, Any]:
+        return {
+            "artifact_type": "decision_mining_estimator",
+            "artifact_version": 1,
+            "estimator_module": __name__,
+            "estimator_class": self.__class__.__name__,
+            "state": {
+                "cfg": asdict(self.cfg),
+                "encoder": asdict(self.encoder) if self.encoder is not None else None,
+                "label_encoder": self.label_encoder,
+                "class_int_to_label": self.class_int_to_label,
+                "base_model": self.base_model,
+                "base_model_cal": self.base_model_cal,
+                "surrogate_tree": self.surrogate_tree,
+                "_cb_cat_cols": self._cb_cat_cols,
+                "base_raw_feature_names": self.base_raw_feature_names,
+                "feature_names": self.feature_names,
+                "surrogate_raw_feature_names": self.surrogate_raw_feature_names,
+                "_priors": self._priors,
+                "_train_X_raw": self._train_X_raw,
+                "_train_X_enc": self._train_X_enc,
+                "_train_y_int": self._train_y_int,
+                "_train_base_proba": self._train_base_proba,
+            },
+        }
+
+    @classmethod
+    def from_artifact(cls, artifact: Dict[str, Any]) -> "FunctionEstimator":
+        state = dict(artifact.get("state", {}))
+        cfg_dict = state.pop("cfg", None) or {}
+        encoder_dict = state.pop("encoder", None)
+
+        obj = cls(model_cfg=ModelConfig(**cfg_dict))
+        if encoder_dict is not None:
+            obj.encoder = FeatureEncoder(**encoder_dict)
+        for key, value in state.items():
+            setattr(obj, key, value)
+        return obj
+
+    def _select_surrogate_features(self, X_raw: pd.DataFrame) -> pd.DataFrame:
+        """Reduce surrogate input space to the most informative raw features.
+
+        This keeps guard trees smaller and faster while preserving the CatBoost
+        base model as the predictive model.
+        """
+        top_k = self.cfg.surrogate_top_k_features
+        if top_k is None:
+            self.surrogate_raw_feature_names = list(X_raw.columns)
+            return X_raw
+
+        try:
+            top_k = int(top_k)
+        except Exception:
+            top_k = None
+
+        if top_k is None or top_k <= 0 or top_k >= len(X_raw.columns):
+            self.surrogate_raw_feature_names = list(X_raw.columns)
+            return X_raw
+
+        model = self.base_model
+        if model is None or getattr(model, "_is_prior_model", False):
+            self.surrogate_raw_feature_names = list(X_raw.columns)
+            return X_raw
+
+        if not hasattr(model, "get_feature_importance"):
+            self.surrogate_raw_feature_names = list(X_raw.columns)
+            return X_raw
+
+        try:
+            importances = np.asarray(model.get_feature_importance(), dtype=float)
+        except Exception:
+            self.surrogate_raw_feature_names = list(X_raw.columns)
+            return X_raw
+
+        if importances.ndim != 1 or importances.size != len(X_raw.columns):
+            self.surrogate_raw_feature_names = list(X_raw.columns)
+            return X_raw
+
+        order = np.argsort(importances)[::-1]
+        selected_idx = [int(i) for i in order[:top_k] if float(importances[int(i)]) > 0.0]
+        if not selected_idx:
+            selected_idx = [int(i) for i in order[:top_k]]
+
+        selected_cols = [str(X_raw.columns[i]) for i in selected_idx]
+        if not selected_cols:
+            selected_cols = list(X_raw.columns)
+
+        self.surrogate_raw_feature_names = selected_cols
+        return X_raw[selected_cols].copy()
+
+    def _get_surrogate_targets(self, y_true: np.ndarray, base_proba: np.ndarray) -> np.ndarray:
+        target_mode = str(self.cfg.surrogate_target).lower().strip()
+        if target_mode == "base_argmax":
+            return np.argmax(base_proba, axis=1).astype(int)
+        return np.asarray(y_true, dtype=int)
 
     def _cast_cat_columns_for_catboost(self, X: pd.DataFrame, cat_cols: List[str]) -> pd.DataFrame:
         """Cast CatBoost categorical columns to strings and fill missing token.
@@ -417,6 +525,7 @@ class FunctionEstimator:
             X_work = X_work[feature_cols]
 
         X_work = X_work.apply(lambda s: s.map(_clean_value))
+        self.base_raw_feature_names = list(X_work.columns)
 
         # encode labels
         le = LabelEncoder()
@@ -472,16 +581,18 @@ class FunctionEstimator:
             base_proba = self.base_model_cal.predict_proba(X_work)
         self._train_base_proba = np.asarray(base_proba, dtype=float)
 
-        # Fit surrogate encoder & surrogate tree on FULL features 
-        X_enc_full, encoder = fit_feature_encoder(X_work, self.cfg, prefix_sep="=")
+        # Fit surrogate encoder & surrogate tree on a reduced raw feature set.
+        X_surrogate_raw = self._select_surrogate_features(X_work)
+        X_enc_full, encoder = fit_feature_encoder(X_surrogate_raw, self.cfg, prefix_sep="=")
         self.encoder = encoder
         self.feature_names = list(X_enc_full.columns)
         self._train_X_enc = X_enc_full
-        self._train_X_raw = X_work
+        self._train_X_raw = X_surrogate_raw
         self._train_y_int = y_int_full
 
-        # Surrogate target = base model argmax (mimic decisions)
-        y_sur = np.argmax(self._train_base_proba, axis=1).astype(int)
+        # Surrogate target can either mimic the base model or explain the true
+        # observed next activity. The latter usually yields cleaner guards.
+        y_sur = self._get_surrogate_targets(y_int_full, self._train_base_proba)
         sw_sur = compute_inverse_freq_weights(y_sur) if bool(self.cfg.use_inverse_freq_weights) else None
 
         alpha = 0.0
@@ -529,6 +640,8 @@ class FunctionEstimator:
                 l2_leaf_reg=float(self.cfg.cb_l2_leaf_reg),
                 loss_function=str(loss),
                 random_seed=int(self.cfg.random_state),
+                thread_count=int(self.cfg.cb_thread_count),
+                allow_writing_files=bool(self.cfg.cb_allow_writing_files),
                 verbose=False,
             )
         # fallback
@@ -568,10 +681,46 @@ class FunctionEstimator:
                 l2_leaf_reg=float(self.cfg.cb_l2_leaf_reg),
                 loss_function=loss,
                 random_seed=int(self.cfg.random_state),
+                thread_count=int(self.cfg.cb_thread_count),
+                allow_writing_files=bool(self.cfg.cb_allow_writing_files),
                 verbose=False,
             )
             try:
-                model.fit(X_cb, y_int, cat_features=cat_idx, sample_weight=sample_weight)
+                fit_kwargs: Dict[str, Any] = {
+                    "cat_features": cat_idx,
+                    "sample_weight": sample_weight,
+                }
+
+                eval_fraction = float(self.cfg.cb_eval_fraction)
+                early_rounds = int(self.cfg.cb_early_stopping_rounds)
+                class_counts = np.bincount(y_int)
+                nonzero = class_counts[class_counts > 0]
+                min_class = int(nonzero.min()) if nonzero.size else 0
+                can_split = (
+                    eval_fraction > 0.0
+                    and len(y_int) >= 50
+                    and min_class >= 2
+                )
+
+                if can_split:
+                    idx = np.arange(len(y_int))
+                    idx_fit, idx_eval = train_test_split(
+                        idx,
+                        test_size=eval_fraction,
+                        random_state=int(self.cfg.random_state),
+                        stratify=y_int,
+                    )
+                    X_fit = X_cb.iloc[idx_fit]
+                    y_fit = y_int[idx_fit]
+                    X_eval = X_cb.iloc[idx_eval]
+                    y_eval = y_int[idx_eval]
+                    fit_kwargs["sample_weight"] = sample_weight[idx_fit] if sample_weight is not None else None
+                    fit_kwargs["eval_set"] = (X_eval, y_eval)
+                    fit_kwargs["use_best_model"] = bool(self.cfg.cb_use_best_model)
+                    fit_kwargs["early_stopping_rounds"] = early_rounds
+                    model.fit(X_fit, y_fit, **fit_kwargs)
+                else:
+                    model.fit(X_cb, y_int, **fit_kwargs)
                 return model
             except Exception as e:
                 if "All features are either constant or ignored" in str(e):
@@ -591,6 +740,12 @@ class FunctionEstimator:
         if self.base_model_cal is None:
             raise RuntimeError("Estimator is not fitted.")
         X_raw = pd.DataFrame([assignment]).apply(lambda s: s.map(_clean_value))
+
+        if self.base_raw_feature_names:
+            for col in self.base_raw_feature_names:
+                if col not in X_raw.columns:
+                    X_raw[col] = np.nan
+            X_raw = X_raw[self.base_raw_feature_names]
 
         if getattr(self.base_model_cal, "_is_prior_model", False):
             proba = self.base_model_cal.predict_proba(X_raw)[0]

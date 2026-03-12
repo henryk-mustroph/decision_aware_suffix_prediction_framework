@@ -1249,6 +1249,11 @@ class EventLogDataset(Dataset):
             all_static_categories
         )
 
+        # Dense guard tensors (populated by prepare_guard_tensors)
+        self._guard_targets: Optional[torch.Tensor] = None    # [N, T, C]
+        self._guard_mask: Optional[torch.Tensor] = None        # [N, T]
+        self._guard_deferred: Optional[torch.Tensor] = None    # [N, T]
+
     @staticmethod
     def _prefix_length_from_zero_mask(zero_mask: torch.Tensor) -> int:
         return int(float(zero_mask.sum().item()))
@@ -1280,6 +1285,54 @@ class EventLogDataset(Dataset):
     def _initialize_decision_data(self) -> torch.Tensor:
         return torch.empty((self.zero_padding.shape[0], 0), dtype=torch.float32)
 
+    def prepare_guard_tensors(self, concept_name_feature_idx: int) -> None:
+        """
+        Convert sparse decision_data to dense guard tensors for training.
+
+        Must be called after set_decision_data.  Creates:
+          _guard_targets   [N, T, num_classes]  soft z_i distributions
+          _guard_mask      [N, T]               1 at decision-labeled positions
+          _guard_deferred  [N, T]               deferred mass per position
+
+        Args:
+            concept_name_feature_idx:  index of the concept:name feature
+                inside ``all_categories[0]``.
+        """
+        if isinstance(self.decision_data, torch.Tensor):
+            return  # decision data not set yet
+
+        cat_categories = self.all_categories[0]
+        _, num_classes, label_to_idx = cat_categories[concept_name_feature_idx]
+
+        N = len(self)
+        T = self.zero_padding.shape[1]
+
+        guard_targets = torch.zeros(N, T, num_classes, dtype=torch.float32)
+        guard_mask = torch.zeros(N, T, dtype=torch.float32)
+        guard_deferred = torch.zeros(N, T, dtype=torch.float32)
+
+        for i in range(N):
+            dd = self.decision_data[i]
+            if not isinstance(dd, list) or len(dd) == 0:
+                continue
+            P = len(dd)
+            offset = T - P  # zero-padding offset
+            for j, entry in enumerate(dd):
+                place_name, dist, *rest = entry
+                deferred_mass = float(rest[0]) if rest else 0.0
+                if place_name == "\u22a5" or not dist:
+                    continue
+                guard_mask[i, offset + j] = 1.0
+                guard_deferred[i, offset + j] = deferred_mass
+                for label, prob in dist.items():
+                    idx = label_to_idx.get(label)
+                    if idx is not None:
+                        guard_targets[i, offset + j, idx] = float(prob)
+
+        self._guard_targets = guard_targets
+        self._guard_mask = guard_mask
+        self._guard_deferred = guard_deferred
+
     def __len__(self):
         """
         Return the number of samples in the dataset.
@@ -1301,7 +1354,15 @@ class EventLogDataset(Dataset):
         static_cat = self.static_categorical_tensor[idx]
         static_cont = self.static_continuous_tensor[idx]
 
-        decision_data = self.decision_data[idx]
+        if self._guard_targets is not None:
+            guard_item = (self._guard_targets[idx], self._guard_mask[idx],
+                          self._guard_deferred[idx])
+        else:
+            guard_item = (
+                torch.zeros(self.zero_padding.shape[1], 0, dtype=torch.float32),
+                torch.zeros(self.zero_padding.shape[1], dtype=torch.float32),
+                torch.zeros(self.zero_padding.shape[1], dtype=torch.float32),
+            )
 
         return (
             case_id,
@@ -1311,7 +1372,7 @@ class EventLogDataset(Dataset):
             zero_mask,
             static_cat,
             static_cont,
-            decision_data,
+            guard_item,
         )
 
     def subset(self, indices: Iterable[int]) -> "EventLogDataset":
@@ -1343,6 +1404,10 @@ class EventLogDataset(Dataset):
             new_ds.decision_data = self.decision_data.index_select(0, idx_tensor)
         else:
             new_ds.decision_data = [list(self.decision_data[i]) for i in idx]
+        if self._guard_targets is not None:
+            new_ds._guard_targets = self._guard_targets.index_select(0, idx_tensor)
+            new_ds._guard_mask = self._guard_mask.index_select(0, idx_tensor)
+            new_ds._guard_deferred = self._guard_deferred.index_select(0, idx_tensor)
         return new_ds
 
     def set_decision_data(
@@ -1378,15 +1443,21 @@ class EventLogDataset(Dataset):
             else:
                 row_data = list(row_data)
 
-            normalized_row: list[tuple[str, dict[str, float]]] = []
+            normalized_row: list[tuple[str, dict[str, float], float]] = []
             for entry in row_data:
-                if not isinstance(entry, tuple) or len(entry) != 2:
+                if not isinstance(entry, tuple) or len(entry) not in (2, 3):
                     raise ValueError(
                         "Each decision_data entry must be a tuple: "
-                        "(activity_label, {label: prob})"
+                        "(place_name, {label: prob}) or "
+                        "(place_name, {label: prob}, deferred_mass)"
                     )
 
-                activity_label, probability_map = entry
+                if len(entry) == 3:
+                    activity_label, probability_map, deferred_mass = entry
+                else:
+                    activity_label, probability_map = entry
+                    deferred_mass = 0.0
+
                 if not isinstance(probability_map, dict):
                     raise ValueError(
                         "Each decision_data tuple must have a dict as second value"
@@ -1400,7 +1471,9 @@ class EventLogDataset(Dataset):
                         raise ValueError("Decision probabilities must be numeric")
                     normalized_map[label] = float(prob)
 
-                normalized_row.append((str(activity_label), normalized_map))
+                normalized_row.append(
+                    (str(activity_label), normalized_map, float(deferred_mass))
+                )
 
             expected_len = self._prefix_length_from_zero_mask(self.zero_padding[idx])
             if len(normalized_row) != expected_len:

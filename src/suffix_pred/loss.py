@@ -1,7 +1,8 @@
 """
 Loss functions for categorical activity-sequence training.
 
-Includes standard and uncertainty-attenuated cross entropy variants.
+Includes standard and uncertainty-attenuated cross entropy variants,
+and a decision-aware guard cross-entropy for regularization.
 """
 
 # performance imports for torch: torch kernel uses one core only.
@@ -11,6 +12,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["TORCH_NUM_THREADS"] = "1" 
 
 import torch
+import torch.nn.functional as F
 
 class Loss:
     def __init__(self):
@@ -38,12 +40,12 @@ class Loss:
         """
         Standard Cross Entropy loss.
       
-        INPUTS:
+        Inputs:
         - pred_logits: Predicted logit values for N events: dim: seq len x batch x labels (logit value for each label)
         - targets: Target class indices for N events: dim: batch x seq len
         - eos_paddings: Optional EOS mask (batch x seq len). Required when EOS masking is enabled.
         
-        OUTPUTS:
+        Outputs:
         - L: Global loss value for categorical event attributes: Tensor (float)
         """
         # Cross Entropy Loss
@@ -61,14 +63,14 @@ class Loss:
         """
         Loss attenuation cross entropy: Combined Epistemic and Aleatoric Uncertainty.
           
-        INPUTS:
+        Inputs:
         - pred_logits: Predicted logit values for N events: dim: seq_len x batch x classes
         - pred_logvars: Predicted log variances per logit value for N events: dim: seq len x batch x classes
         - T: T gaussian distributed random epsilon value generations.
         - targets: Target class indices for N events: dim: batch x  seq len
         - eos_paddings: Optional EOS mask (batch x seq len). Required when EOS masking is enabled.
         
-        OUTPUTS:
+        Outputs:
         - L: Global loss value for categorical event attributes: Tensor (float)
         """
             
@@ -101,4 +103,44 @@ class Loss:
         L = self._reduce_loss(L, eos_paddings)
           
         return L
-        
+
+    def guard_cross_entropy(self, pred_logits, guard_targets, guard_mask,
+                            guard_deferred=None, eos_paddings=None):
+        """
+        Decision-aware guard cross-entropy loss (L_guard).
+
+        Computes the soft cross-entropy between the decision-model distribution z_i and the predicted next-event-label distribution, weighted by
+        (1 - deferred_mass) so that steps where the decision model cannot fully resolve the next event contribute less.
+
+        Inputs:
+        - pred_logits: Predicted logit values: dim: seq_len x batch x classes
+        - guard_targets: Soft target distributions from the decision model: dim: batch x seq_len x classes.  z_i(a) for each event and label.
+        - guard_mask: Binary indicator for decision-labeled events: dim: batch x seq_len.  1 where z_i != bot, 0 otherwise.
+        - guard_deferred: Deferred mass per step: dim: batch x seq_len. Values in [0, 1].  If None, no deferred weighting is applied.
+        - eos_paddings: Optional EOS mask (batch x seq_len).
+
+        Outputs:
+        - L_guard: Scalar guard loss, averaged over effective weight sum. Returns 0 (with grad) if no decision-labeled steps in batch.
+        """
+        # log softmax of predictions: [S, B, C] -> [B, S, C]
+        log_probs = F.log_softmax(pred_logits, dim=-1).permute(1, 0, 2)
+
+        # Pointwise: -z(a) * log p(a), summed over classes -> [B, S]
+        per_step = -(guard_targets * log_probs).sum(dim=-1)
+
+        # Per-step weight: (1 - deferred) so that partially-resolved
+        # predictions contribute proportionally to their resolved mass.
+        if guard_deferred is not None:
+            weight = (1.0 - guard_deferred) * guard_mask
+        else:
+            weight = guard_mask
+
+        # Combine with EOS masking if provided
+        if eos_paddings is not None:
+            weight = weight * eos_paddings
+
+        weighted = per_step * weight
+
+        # Normalize by sum of weights (effective N_B)
+        W = weight.sum().clamp(min=1e-8)
+        return weighted.sum() / W
