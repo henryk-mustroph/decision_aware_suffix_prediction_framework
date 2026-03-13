@@ -20,11 +20,8 @@ import re
 import numpy as np
 import pandas as pd
 from pm4py.visualization.petri_net import visualizer as pn_vis
-
-from decision_mining.function_estimator_DT_basic import FunctionEstimator as fe_basic
 from decision_mining.function_estimator_catboost_advanced import FunctionEstimator as fe_advanced
 
-from decision_mining.function_estimator_DT_basic import ModelConfig as mc_basic
 from decision_mining.function_estimator_catboost_advanced import ModelConfig as mc_advanced
 
 @dataclass
@@ -323,10 +320,8 @@ class DecisionDiscovery:
 
             # only contains the past_event_counts as past data?
             X_raw = pd.DataFrame(rows)
-
-            if method == 'basic':
-                est = fe_basic.fit_from_xy(X_raw, labels, feature_cols=None, model_cfg=mc_config or mc_basic())
-            elif method == 'advanced':
+           
+            if method == 'advanced':
                 est = fe_advanced.fit_from_xy(X_raw, labels, feature_cols=None, model_cfg=mc_config or mc_advanced())
             else:
                 raise ValueError('Only basic and advanced exist!')

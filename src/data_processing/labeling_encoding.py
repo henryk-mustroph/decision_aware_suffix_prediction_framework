@@ -1250,9 +1250,9 @@ class EventLogDataset(Dataset):
         )
 
         # Dense guard tensors (populated by prepare_guard_tensors)
-        self._guard_targets: Optional[torch.Tensor] = None    # [N, T, C]
-        self._guard_mask: Optional[torch.Tensor] = None        # [N, T]
-        self._guard_deferred: Optional[torch.Tensor] = None    # [N, T]
+        self._guard_targets: Optional[torch.Tensor] = None     # [N, T, C]
+        self._guard_mask: Optional[torch.Tensor] = None         # [N, T]
+        self._guard_confidence: Optional[torch.Tensor] = None  # [N, T]
 
     @staticmethod
     def _prefix_length_from_zero_mask(zero_mask: torch.Tensor) -> int:
@@ -1290,9 +1290,9 @@ class EventLogDataset(Dataset):
         Convert sparse decision_data to dense guard tensors for training.
 
         Must be called after set_decision_data.  Creates:
-          _guard_targets   [N, T, num_classes]  soft z_i distributions
-          _guard_mask      [N, T]               1 at decision-labeled positions
-          _guard_deferred  [N, T]               deferred mass per position
+          _guard_targets    [N, T, num_classes]  soft z_i distributions
+          _guard_mask       [N, T]               1 at decision-labeled positions
+          _guard_confidence [N, T]               c_i = max(z_i) at decision positions
 
         Args:
             concept_name_feature_idx:  index of the concept:name feature
@@ -1309,21 +1309,24 @@ class EventLogDataset(Dataset):
 
         guard_targets = torch.zeros(N, T, num_classes, dtype=torch.float32)
         guard_mask = torch.zeros(N, T, dtype=torch.float32)
-        guard_deferred = torch.zeros(N, T, dtype=torch.float32)
+        guard_confidence = torch.zeros(N, T, dtype=torch.float32)
 
         for i in range(N):
             dd = self.decision_data[i]
             if not isinstance(dd, list) or len(dd) == 0:
                 continue
             P = len(dd)
-            offset = T - P  # zero-padding offset
+            offset = T - P  # zero-padding offset: right-aligns P labels into T slots
             for j, entry in enumerate(dd):
                 place_name, dist, *rest = entry
-                deferred_mass = float(rest[0]) if rest else 0.0
+                # 3rd element (index 0 of rest) is c_i when present
+                c_i = float(rest[0]) if len(rest) >= 1 else (
+                    max(dist.values()) if dist else 0.0
+                )
                 if place_name == "\u22a5" or not dist:
                     continue
                 guard_mask[i, offset + j] = 1.0
-                guard_deferred[i, offset + j] = deferred_mass
+                guard_confidence[i, offset + j] = c_i
                 for label, prob in dist.items():
                     idx = label_to_idx.get(label)
                     if idx is not None:
@@ -1331,7 +1334,58 @@ class EventLogDataset(Dataset):
 
         self._guard_targets = guard_targets
         self._guard_mask = guard_mask
-        self._guard_deferred = guard_deferred
+        self._guard_confidence = guard_confidence
+
+    def apply_coverage_gate(
+        self,
+        coverage_by_place: Dict[str, float],
+        coverage_threshold: float,
+    ) -> None:
+        """Zero out guard_mask positions for low-coverage decision places.
+
+        A decision place p is considered low-coverage when
+        ``coverage_by_place[p] < coverage_threshold``, i.e. the decision
+        model cannot predict the true next activity in most cases because
+        the true label lies outside the model's support.  Skipping such
+        places prevents spurious regularization from a poorly-calibrated
+        distribution.
+
+        Must be called after :meth:`prepare_guard_tensors`.
+
+        Parameters
+        ----------
+        coverage_by_place:
+            ``{place_name: coverage_value}`` dict, e.g. from
+            :func:`decision_labeling.compute_dp_diagnostics`.
+        coverage_threshold:
+            Places with ``coverage < coverage_threshold`` have their guard
+            positions zeroed.  A sensible starting value is ``0.5``.
+        """
+        if self._guard_mask is None:
+            raise RuntimeError("prepare_guard_tensors must be called first.")
+        if not isinstance(self.decision_data, list):
+            return
+
+        low_coverage_places = {
+            p for p, cov in coverage_by_place.items()
+            if cov < coverage_threshold
+        }
+        if not low_coverage_places:
+            return
+
+        N = len(self)
+        T = self._guard_mask.shape[1]
+
+        for i in range(N):
+            dd = self.decision_data[i]
+            if not isinstance(dd, list) or len(dd) == 0:
+                continue
+            P = len(dd)
+            offset = T - P
+            for j, entry in enumerate(dd):
+                place_name = entry[0]
+                if place_name in low_coverage_places:
+                    self._guard_mask[i, offset + j] = 0.0
 
     def __len__(self):
         """
@@ -1355,8 +1409,12 @@ class EventLogDataset(Dataset):
         static_cont = self.static_continuous_tensor[idx]
 
         if self._guard_targets is not None:
-            guard_item = (self._guard_targets[idx], self._guard_mask[idx],
-                          self._guard_deferred[idx])
+            guard_item = (
+                self._guard_targets[idx],
+                self._guard_mask[idx],
+                self._guard_confidence[idx] if self._guard_confidence is not None
+                else torch.zeros(self.zero_padding.shape[1], dtype=torch.float32),
+            )
         else:
             guard_item = (
                 torch.zeros(self.zero_padding.shape[1], 0, dtype=torch.float32),
@@ -1407,7 +1465,8 @@ class EventLogDataset(Dataset):
         if self._guard_targets is not None:
             new_ds._guard_targets = self._guard_targets.index_select(0, idx_tensor)
             new_ds._guard_mask = self._guard_mask.index_select(0, idx_tensor)
-            new_ds._guard_deferred = self._guard_deferred.index_select(0, idx_tensor)
+            if self._guard_confidence is not None:
+                new_ds._guard_confidence = self._guard_confidence.index_select(0, idx_tensor)
         return new_ds
 
     def set_decision_data(
@@ -1445,18 +1504,27 @@ class EventLogDataset(Dataset):
 
             normalized_row: list[tuple[str, dict[str, float], float]] = []
             for entry in row_data:
-                if not isinstance(entry, tuple) or len(entry) not in (2, 3):
+                if not isinstance(entry, tuple) or len(entry) not in (2, 3, 4):
                     raise ValueError(
                         "Each decision_data entry must be a tuple: "
-                        "(place_name, {label: prob}) or "
-                        "(place_name, {label: prob}, deferred_mass)"
+                        "(place_name, {label: prob}), "
+                        "(place_name, {label: prob}, c_i), or "
+                        "(place_name, A_i, {label: prob}, c_i)"
                     )
 
-                if len(entry) == 3:
-                    activity_label, probability_map, deferred_mass = entry
-                else:
-                    activity_label, probability_map = entry
-                    deferred_mass = 0.0
+                activity_label = entry[0]
+                probability_map = entry[1]
+                c_i: float = 0.0
+
+                # Supports both compact tuples and rich tuples with A_i:
+                # (p_i, z_i), (p_i, z_i, c_i), (p_i, A_i, z_i, c_i)
+                if len(entry) == 4 and isinstance(entry[1], list):
+                    probability_map = entry[2]
+                    c_i = float(entry[3])
+                elif len(entry) >= 3:
+                    c_i = float(entry[2])
+                elif isinstance(probability_map, dict) and probability_map:
+                    c_i = max(float(p) for p in probability_map.values())
 
                 if not isinstance(probability_map, dict):
                     raise ValueError(
@@ -1472,7 +1540,7 @@ class EventLogDataset(Dataset):
                     normalized_map[label] = float(prob)
 
                 normalized_row.append(
-                    (str(activity_label), normalized_map, float(deferred_mass))
+                    (str(activity_label), normalized_map, c_i)
                 )
 
             expected_len = self._prefix_length_from_zero_mask(self.zero_padding[idx])
@@ -1564,16 +1632,14 @@ class EventLogLoader:
         alignments: Optional[List] = None,
         mode: str = "offline",
     ) -> None:
-        """Apply decision-aware labeling to a dataset in-place.
+        """
+        Apply decision-aware labeling to a dataset in-place.
 
         Parameters
         ----------
-        dataset : EventLogDataset
-            The dataset to label (modified in-place via ``set_decision_data``).
-        petri_net : tuple
-            ``(net, initial_marking, final_marking)``.
-        decision_model_dir : str
-            Directory with per-place ``.pkl`` estimator files.
+        dataset : EventLogDataset: The dataset to label (modified in-place via ``set_decision_data``).
+        petri_net : tuple: ``(net, initial_marking, final_marking)``.
+        decision_model_dir : str: Directory with per-place ``.pkl`` estimator files.
         decision_places_bundle_path : str
             Path to ``decision_places_bundle.json``.
         dynamic_attributes, static_attributes : list[str] | None

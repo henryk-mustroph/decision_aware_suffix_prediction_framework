@@ -48,6 +48,7 @@ class Trainer:
         self.epochs = optimize_values.get("epochs", 1)
         self.mini_batches = optimize_values.get("mini_batches", 1)
         self.shuffle = optimize_values.get("shuffle", True)
+        self.guard_support_threshold = optimize_values.get("guard_support_threshold", 0.0)
 
         self.save_model_n_th_epoch = save_model_n_th_epoch
         self.saving_path = saving_path
@@ -83,8 +84,12 @@ class Trainer:
             raise ValueError(
                 f"Unsupported batch format with len={len(batch)}. " "Expected full 8-tuple: (_, cats, nums, eos, zero, cats_static, nums_static, guard_data).")
 
-        # guard_data is a list [guard_targets, guard_mask, guard_deferred] from the DataLoader
-        guard_targets, guard_mask, guard_deferred = guard_data
+        # guard_data is a tuple (guard_targets, guard_mask[, guard_confidence])
+        if len(guard_data) == 3:
+            guard_targets, guard_mask, guard_confidence = guard_data
+        else:
+            guard_targets, guard_mask = guard_data
+            guard_confidence = None
 
         return {"cats": cats,
                 "nums": nums,
@@ -94,7 +99,7 @@ class Trainer:
                 "nums_static": nums_static,
                 "guard_targets": guard_targets,
                 "guard_mask": guard_mask,
-                "guard_deferred": guard_deferred}
+                "guard_confidence": guard_confidence}
 
     def _prepare_static_inputs(self, cats_static, nums_static):
         static_cat = None
@@ -142,7 +147,30 @@ class Trainer:
 
         return prefix_mask, eos_paddings_suffix
 
-    def _extract_guard_suffix(self, guard_targets, guard_mask, guard_deferred, suffix_size):
+    def _scheduled_sampling_rates(self, step_index, epsilon_max, inverse_sigmoid_k,
+                                  min_teacher_forcing=0.0):
+        """
+        Inverse-sigmoid scheduled sampling.
+
+        Returns:
+            epsilon: probability of feeding model prediction.
+            teacher_forcing_ratio: probability of feeding ground truth.
+        """
+        k = max(1e-6, float(inverse_sigmoid_k))
+        t = float(step_index)
+
+        # Rising inverse-sigmoid from ~0 to ~1 with exact 0 at t=0.
+        raw = 1.0 - (k / (k + math.exp(t / k)))
+        raw0 = 1.0 - (k / (k + 1.0))
+        norm = (raw - raw0) / max(1e-8, (1.0 - raw0))
+
+        epsilon = float(epsilon_max) * max(0.0, min(1.0, norm))
+        teacher_forcing_ratio = max(float(min_teacher_forcing), 1.0 - epsilon)
+        teacher_forcing_ratio = min(1.0, teacher_forcing_ratio)
+        epsilon = 1.0 - teacher_forcing_ratio
+        return epsilon, teacher_forcing_ratio
+
+    def _extract_guard_suffix(self, guard_targets, guard_mask, suffix_size, guard_confidence=None):
         """
         Extract guard data aligned with decoder input events.
 
@@ -153,15 +181,17 @@ class Trainer:
         Returns:
             guard_suffix_targets  : [B, S, C] or None
             guard_suffix_mask     : [B, S] or None
-            guard_suffix_deferred : [B, S] or None
+            guard_suffix_conf     : [B, S] or None
         """
         if guard_targets.shape[-1] == 0:
             return None, None, None
         S = suffix_size
         guard_suffix_targets = guard_targets[:, -(S + 1):-1, :].to(self.device)
         guard_suffix_mask = guard_mask[:, -(S + 1):-1].to(self.device)
-        guard_suffix_deferred = guard_deferred[:, -(S + 1):-1].to(self.device)
-        return guard_suffix_targets, guard_suffix_mask, guard_suffix_deferred
+        guard_suffix_conf = None
+        if guard_confidence is not None:
+            guard_suffix_conf = guard_confidence[:, -(S + 1):-1].to(self.device)
+        return guard_suffix_targets, guard_suffix_mask, guard_suffix_conf
 
 
 # Trainer for the U-ED-LSTM: 
@@ -231,6 +261,10 @@ class KTrainer(Trainer):
         # Teacher forcing
         self.min_teacher_forcing_value = optimize_values["min_teacher_forcing_value"]
         self.max_teacher_forcing_value = optimize_values["max_teacher_forcing_value"]
+        self.scheduled_sampling_epsilon_max = optimize_values.get(
+            "scheduled_sampling_epsilon_max", self.max_teacher_forcing_value)
+        self.scheduled_sampling_k = optimize_values.get(
+            "scheduled_sampling_k", max(1.0, self.epochs / 10.0))
         
         # Events in sufffix: Dependent on data set
         self.suffix_data_split_value = suffix_data_split_value
@@ -290,8 +324,13 @@ class KTrainer(Trainer):
             epoch_loss = 0.0
             num_batches_per_epoch = 0.0
             
-            # Reduce Teacher forcing ratio dynamically (scheduled sampling)
-            self.teacher_forcing_ratio = max(self.min_teacher_forcing_value, self.max_teacher_forcing_value - epoch / (self.epochs * 0.5))
+            # Inverse-sigmoid scheduled sampling: increase replacement epsilon over time.
+            self.scheduled_sampling_epsilon, self.teacher_forcing_ratio = self._scheduled_sampling_rates(
+                step_index=epoch,
+                epsilon_max=self.scheduled_sampling_epsilon_max,
+                inverse_sigmoid_k=self.scheduled_sampling_k,
+                min_teacher_forcing=self.min_teacher_forcing_value,
+            )
             
             # Bacth Loop
             for i, train_data in enumerate(train_dataloader): 
@@ -304,7 +343,7 @@ class KTrainer(Trainer):
                 nums_static = batch["nums_static"]
                 guard_targets = batch["guard_targets"]
                 guard_mask = batch["guard_mask"]
-                guard_deferred = batch["guard_deferred"]
+                guard_confidence = batch["guard_confidence"]
 
                 # static data (only prefix input data)
                 if use_statics:
@@ -323,8 +362,8 @@ class KTrainer(Trainer):
                                                                      use_eos_padd_masking=use_eos_padd_masking)
 
                 # Guard data aligned to decoder steps
-                guard_suffix_targets, guard_suffix_mask, guard_suffix_deferred = self._extract_guard_suffix(
-                    guard_targets, guard_mask, guard_deferred, self.suffix_data_split_value)
+                guard_suffix_targets, guard_suffix_mask, guard_suffix_conf = self._extract_guard_suffix(
+                    guard_targets, guard_mask, self.suffix_data_split_value, guard_confidence=guard_confidence)
 
                 # Optimization (categorical only)
                 cat_losses_dict, loss_value = self.train_epoch(prefixes=prefixes,
@@ -334,7 +373,8 @@ class KTrainer(Trainer):
                                                                static_inputs=static_inputs,
                                                                guard_targets=guard_suffix_targets,
                                                                guard_mask=guard_suffix_mask,
-                                                               guard_deferred=guard_suffix_deferred)
+                                                               guard_confidence=guard_suffix_conf,
+                                                               )
                 
                 # Loss calculation and output
                 # Accumulate the categorical losses
@@ -362,7 +402,11 @@ class KTrainer(Trainer):
             current_lr = self._current_lr()
             
             # Prints per Epoch:
-            tqdm.write(f"Epoch [{epoch+1}/{self.epochs}], Learning Rate: {current_lr}, Teacher forcing ratio: {self.teacher_forcing_ratio}")
+            tqdm.write(
+                f"Epoch [{epoch+1}/{self.epochs}], Learning Rate: {current_lr}, "
+                f"Teacher forcing ratio: {self.teacher_forcing_ratio:.4f}, "
+                f"Scheduled sampling epsilon: {self.scheduled_sampling_epsilon:.4f}"
+            )
             
             tqdm.write(f"Training: Avg Attenuated Training Loss: {epoch_loss_train:.4f}")
             
@@ -395,7 +439,7 @@ class KTrainer(Trainer):
         return train_attenuated_losses, val_losses, val_attenuated_losses
 
     def train_epoch(self, prefixes, suffixes, eos_paddings, prefix_mask=None, static_inputs=None,
-                    guard_targets=None, guard_mask=None, guard_deferred=None):
+                    guard_targets=None, guard_mask=None, guard_confidence=None):
         """
         one epoch iteration
         """
@@ -461,8 +505,10 @@ class KTrainer(Trainer):
                 pred_logits=mean_cat_pred,
                 guard_targets=guard_targets,
                 guard_mask=guard_mask,
-                guard_deferred=guard_deferred,
-                eos_paddings=eos_paddings)
+                eos_paddings=eos_paddings,
+                next_event_targets=target_cat.long(),
+                guard_confidence=guard_confidence,
+                support_threshold=self.guard_support_threshold)
             loss = loss + self.lambda_g * guard_loss
 
         loss.backward()
@@ -711,7 +757,7 @@ class CTraining(Trainer):
                 nums_static = batch["nums_static"]
                 guard_targets_full = batch["guard_targets"]
                 guard_mask_full = batch["guard_mask"]
-                guard_deferred_full = batch["guard_deferred"]
+                guard_conf_full = batch["guard_confidence"]
 
                 # Get prefixes and next-activity targets (S=1).
                 prefixes, target_act, eos_next, V, valid_mask = self._preprocess_batch(cats=cats, nums=nums, eos_paddings=eos_paddings)
@@ -736,13 +782,17 @@ class CTraining(Trainer):
                     # Apply same valid_mask used for prefix/target filtering
                     gt = guard_targets_full[valid_mask][:, -2, :].unsqueeze(1).to(self.device)  # [V, 1, C]
                     gm = guard_mask_full[valid_mask][:, -2].unsqueeze(1).to(self.device)        # [V, 1]
-                    gd = guard_deferred_full[valid_mask][:, -2].unsqueeze(1).to(self.device)    # [V, 1]
+                    gc = None
+                    if guard_conf_full is not None:
+                        gc = guard_conf_full[valid_mask][:, -2].unsqueeze(1).to(self.device)    # [V, 1]
                     guard_loss = self.loss_obj.guard_cross_entropy(
                         pred_logits=pred_logits,
                         guard_targets=gt,
                         guard_mask=gm,
-                        guard_deferred=gd,
-                        eos_paddings=eos_next)
+                        eos_paddings=eos_next,
+                        next_event_targets=target_act.unsqueeze(1),
+                        guard_confidence=gc,
+                        support_threshold=self.guard_support_threshold)
                     loss = loss + self.lambda_g * guard_loss
 
                 self.optimizer.zero_grad()
@@ -838,7 +888,7 @@ class TTraining(Trainer):
       - RMSprop optimizer, lr=5e-5
       - Gradient norm clipping to 1
       - 100 iterations (epochs)
-      - Teacher forcing with linear annealing
+    - Teacher forcing via inverse-sigmoid scheduled sampling
 
     When ``use_gan=False`` in optimize_values, only L_supervised is used (MLE-only).
     """
@@ -878,6 +928,10 @@ class TTraining(Trainer):
         # Teacher forcing
         self.min_teacher_forcing_value = optimize_values.get("min_teacher_forcing_value", 0.0)
         self.max_teacher_forcing_value = optimize_values.get("max_teacher_forcing_value", 0.5)
+        self.scheduled_sampling_epsilon_max = optimize_values.get(
+            "scheduled_sampling_epsilon_max", self.max_teacher_forcing_value)
+        self.scheduled_sampling_k = optimize_values.get(
+            "scheduled_sampling_k", max(1.0, self.epochs / 10.0))
 
         # Gumbel-softmax temperature annealing (τ: 0.9 → ~0, exponential)
         self.tau_start = optimize_values.get("tau_start", 0.9)
@@ -908,7 +962,7 @@ class TTraining(Trainer):
         print("Mode: ", "GAN (Algorithm 1: MLMME)" if self.use_gan else "MLE-only")
         print("Epochs (iterations): ", self.epochs)
         print("Gumbel-softmax τ: ", f"{self.tau_start} → {self.tau_min} (exponential anneal)")
-        print("Teacher forcing: ", f"{self.max_teacher_forcing_value} → {self.min_teacher_forcing_value}")
+        print("Scheduled sampling ε:", f"0.0 → {self.scheduled_sampling_epsilon_max} (inverse-sigmoid)")
 
     def _init_prefix_feature_indices(self):
         """Map configured model feature names to dataset tensor indices."""
@@ -943,7 +997,7 @@ class TTraining(Trainer):
         eos_paddings = unpacked["eos_paddings"]
         guard_targets_full = unpacked["guard_targets"]
         guard_mask_full = unpacked["guard_mask"]
-        guard_deferred_full = unpacked["guard_deferred"]
+        guard_conf_full = unpacked["guard_confidence"]
 
         # Split into prefix / suffix with fixed S (same as KTrainer)
         prefixes, suffixes = self._split_prefix_suffix(cats=cats,
@@ -962,10 +1016,13 @@ class TTraining(Trainer):
         eos_suffix = None if eos_paddings is None else eos_paddings[:, -self.suffix_data_split_value:].to(self.device)
 
         # Guard data aligned to decoder steps
-        guard_suffix_targets, guard_suffix_mask, guard_suffix_deferred = self._extract_guard_suffix(
-            guard_targets_full, guard_mask_full, guard_deferred_full, self.suffix_data_split_value)
+        guard_suffix_targets, guard_suffix_mask, guard_suffix_conf = self._extract_guard_suffix(
+            guard_targets_full,
+            guard_mask_full,
+            self.suffix_data_split_value,
+            guard_confidence=guard_conf_full)
 
-        return prefixes, act_targets, eos_suffix, guard_suffix_targets, guard_suffix_mask, guard_suffix_deferred
+        return prefixes, act_targets, eos_suffix, guard_suffix_targets, guard_suffix_mask, guard_suffix_conf
 
     def _masked_activity_loss(self, logits, targets, eos_mask=None):
         """Cross-entropy loss. logits: [S, B, C], targets: [B, S]."""
@@ -1008,10 +1065,12 @@ class TTraining(Trainer):
             # Exponential Gumbel-softmax temperature annealing (τ: 0.9 → ~0)
             tau = max(self.tau_min, self.tau_start * math.exp(-anneal_rate * epoch))
 
-            # Linear teacher forcing annealing (same schedule as KTrainer)
-            self.teacher_forcing_ratio = max(
-                self.min_teacher_forcing_value,
-                self.max_teacher_forcing_value - epoch / max(1, self.epochs * 0.5),
+            # Inverse-sigmoid scheduled sampling: increase replacement epsilon over time.
+            self.scheduled_sampling_epsilon, self.teacher_forcing_ratio = self._scheduled_sampling_rates(
+                step_index=epoch,
+                epsilon_max=self.scheduled_sampling_epsilon_max,
+                inverse_sigmoid_k=self.scheduled_sampling_k,
+                min_teacher_forcing=self.min_teacher_forcing_value,
             )
 
             gen_loss_total = 0.0
@@ -1019,7 +1078,7 @@ class TTraining(Trainer):
             n_batches = 0
 
             for i, batch in enumerate(train_loader):
-                prefixes, target_suffix_act, eos_suffix, guard_suffix_targets, guard_suffix_mask, guard_suffix_deferred = self._unpack_batch(batch)
+                prefixes, target_suffix_act, eos_suffix, guard_suffix_targets, guard_suffix_mask, guard_suffix_conf = self._unpack_batch(batch)
 
                 if self.use_gan:
                     # ==========================================================
@@ -1089,8 +1148,10 @@ class TTraining(Trainer):
                         pred_logits=logits_g,
                         guard_targets=guard_suffix_targets,
                         guard_mask=guard_suffix_mask,
-                        guard_deferred=guard_suffix_deferred,
-                        eos_paddings=eos_suffix)
+                        eos_paddings=eos_suffix,
+                        next_event_targets=target_suffix_act,
+                        guard_confidence=guard_suffix_conf,
+                        support_threshold=self.guard_support_threshold)
                     gen_loss = gen_loss + self.lambda_g * guard_loss
 
                 gen_loss.backward()
@@ -1115,7 +1176,7 @@ class TTraining(Trainer):
             current_lr = self._current_lr()
             tqdm.write(
                 f"Epoch [{epoch+1}/{self.epochs}], LR: {current_lr}, "
-                f"τ: {tau:.4f}, TF: {self.teacher_forcing_ratio:.4f}, "
+                f"τ: {tau:.4f}, TF: {self.teacher_forcing_ratio:.4f}, ε: {self.scheduled_sampling_epsilon:.4f}, "
                 f"Gen Loss: {epoch_gen_loss:.4f}, Disc Loss: {epoch_disc_loss:.4f}, "
                 f"Val Loss: {val_loss:.4f}, Beam Acc: {val_acc:.4f}"
             )

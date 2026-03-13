@@ -105,42 +105,65 @@ class Loss:
         return L
 
     def guard_cross_entropy(self, pred_logits, guard_targets, guard_mask,
-                            guard_deferred=None, eos_paddings=None):
+                            eos_paddings=None, next_event_targets=None,
+                            guard_confidence=None, support_threshold=0.0):
         """
-        Decision-aware guard cross-entropy loss (L_guard).
+        Decision-aware guard KL loss (L_guard).
 
-        Computes the soft cross-entropy between the decision-model distribution z_i and the predicted next-event-label distribution, weighted by
-        (1 - deferred_mass) so that steps where the decision model cannot fully resolve the next event contribute less.
+        Computes a weighted KL divergence between the thresholded and
+        renormalized decision-model distribution q and the predicted
+        next-event-label distribution.
 
         Inputs:
         - pred_logits: Predicted logit values: dim: seq_len x batch x classes
         - guard_targets: Soft target distributions from the decision model: dim: batch x seq_len x classes.  z_i(a) for each event and label.
-        - guard_mask: Binary indicator for decision-labeled events: dim: batch x seq_len.  1 where z_i != bot, 0 otherwise.
-        - guard_deferred: Deferred mass per step: dim: batch x seq_len. Values in [0, 1].  If None, no deferred weighting is applied.
+                - guard_mask: Binary indicator for decision-labeled events: dim: batch x seq_len.  1 where z_i != bot, 0 otherwise.
         - eos_paddings: Optional EOS mask (batch x seq_len).
+                - next_event_targets: Ground-truth next-event labels (batch x seq_len).
+                    Used to compute correctness weights w = z(a*).
+                - guard_confidence: Optional confidence c_i with dim (batch x seq_len).
+                - support_threshold: Decision-support threshold tau.
 
         Outputs:
-        - L_guard: Scalar guard loss, averaged over effective weight sum. Returns 0 (with grad) if no decision-labeled steps in batch.
+        - L_guard: Scalar guard loss, averaged over effective weight sum.
+          Returns 0 (with grad) if no regularized steps exist.
         """
-        # log softmax of predictions: [S, B, C] -> [B, S, C]
+        if guard_targets is None or guard_targets.shape[-1] == 0:
+            return pred_logits.sum() * 0.0
+
+        # log p_theta(a): [S, B, C] -> [B, S, C]
         log_probs = F.log_softmax(pred_logits, dim=-1).permute(1, 0, 2)
 
-        # Pointwise: -z(a) * log p(a), summed over classes -> [B, S]
-        per_step = -(guard_targets * log_probs).sum(dim=-1)
+        # Build support set S := {a | z(a) >= tau}, then renormalize to q.
+        z = guard_targets.clamp_min(0.0)
+        support = (z >= support_threshold).to(z.dtype)
+        q_num = z * support
+        q_den = q_num.sum(dim=-1, keepdim=True)
+        valid_support = (q_den.squeeze(-1) > 0).to(z.dtype)
+        q = q_num / q_den.clamp(min=1e-8)
 
-        # Per-step weight: (1 - deferred) so that partially-resolved
-        # predictions contribute proportionally to their resolved mass.
-        if guard_deferred is not None:
-            weight = (1.0 - guard_deferred) * guard_mask
-        else:
-            weight = guard_mask
+        # KL(q || p) = sum_a q(a) * (log q(a) - log p(a))
+        per_step_kl = (q * (torch.log(q.clamp(min=1e-8)) - log_probs)).sum(dim=-1)
 
-        # Combine with EOS masking if provided
+        # Base weight: decision-labeled positions and non-empty support.
+        weight = guard_mask * valid_support
+
+        # Correctness weight w = z(a*), where a* is the ground-truth next label.
+        if next_event_targets is not None:
+            a_star = next_event_targets.long().unsqueeze(-1)
+            w = torch.gather(z, dim=-1, index=a_star).squeeze(-1)
+            weight = weight * w
+
+        # Confidence weight c_i (defaults to 1 when not provided).
+        if guard_confidence is not None:
+            weight = weight * guard_confidence
+
+        # Optional EOS masking.
         if eos_paddings is not None:
             weight = weight * eos_paddings
 
-        weighted = per_step * weight
+        weighted = per_step_kl * weight
 
-        # Normalize by sum of weights (effective N_B)
+        # Normalize by effective batch weight sum.
         W = weight.sum().clamp(min=1e-8)
         return weighted.sum() / W
