@@ -104,30 +104,28 @@ class Loss:
           
         return L
 
+    # correcte
     def guard_cross_entropy(self, pred_logits, guard_targets, guard_mask,
                             eos_paddings=None, next_event_targets=None,
                             guard_confidence=None, support_threshold=0.0):
         """
         Decision-aware guard KL loss (L_guard).
 
-        Computes a weighted KL divergence between the thresholded and
-        renormalized decision-model distribution q and the predicted
-        next-event-label distribution.
+        Computes a weighted KL divergence between the thresholded and renormalized decision-model distribution q and the predicted next-event-label distribution.
 
         Inputs:
         - pred_logits: Predicted logit values: dim: seq_len x batch x classes
         - guard_targets: Soft target distributions from the decision model: dim: batch x seq_len x classes.  z_i(a) for each event and label.
-                - guard_mask: Binary indicator for decision-labeled events: dim: batch x seq_len.  1 where z_i != bot, 0 otherwise.
+        - guard_mask: Binary indicator for decision-labeled events: dim: batch x seq_len.  1 where z_i != bot, 0 otherwise.
         - eos_paddings: Optional EOS mask (batch x seq_len).
-                - next_event_targets: Ground-truth next-event labels (batch x seq_len).
-                    Used to compute correctness weights w = z(a*).
-                - guard_confidence: Optional confidence c_i with dim (batch x seq_len).
-                - support_threshold: Decision-support threshold tau.
+        - next_event_targets: Ground-truth next-event labels (batch x seq_len). Used to compute correctness weights w = z(a*).
+        - guard_confidence: Optional confidence c_i with dim (batch x seq_len).
+        - support_threshold: Decision-support threshold tau.
 
         Outputs:
-        - L_guard: Scalar guard loss, averaged over effective weight sum.
-          Returns 0 (with grad) if no regularized steps exist.
+        - L_guard: Scalar guard loss, averaged over effective weight sum. Returns 0 (with grad) if no regularized steps exist.
         """
+        # no soft next-event labels given:
         if guard_targets is None or guard_targets.shape[-1] == 0:
             return pred_logits.sum() * 0.0
 
@@ -151,7 +149,8 @@ class Loss:
         # Correctness weight w = z(a*), where a* is the ground-truth next label.
         if next_event_targets is not None:
             a_star = next_event_targets.long().unsqueeze(-1)
-            w = torch.gather(z, dim=-1, index=a_star).squeeze(-1)
+            support_star = torch.gather(support, dim=-1, index=a_star).squeeze(-1)
+            w = torch.gather(z, dim=-1, index=a_star).squeeze(-1) * support_star
             weight = weight * w
 
         # Confidence weight c_i (defaults to 1 when not provided).
@@ -166,4 +165,5 @@ class Loss:
 
         # Normalize by effective batch weight sum.
         W = weight.sum().clamp(min=1e-8)
+        
         return weighted.sum() / W

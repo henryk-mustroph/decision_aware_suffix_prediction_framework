@@ -72,16 +72,15 @@ class Seq2Seq(nn.Module):
         assert encoder.n_layers == decoder.n_layers, \
             "Encoder and decoder must have equal number of layers!"
 
-    def forward(self, src, trg, teacher_forcing_ratio=0.5):
+    def forward(self, src, trg, start_input, teacher_forcing_ratio=0.5):
         hidden, cell = self.encoder(src)
 
-        begin_symbol = torch.ones(
-            (trg.size(0), 1, trg.size(2)), device=src.device,
-        )
-        inp = begin_symbol
+        predictions = []
+        inp = start_input
 
         for i in range(trg.size(1)):
             output, hidden, cell = self.decoder(inp, hidden, cell)
+            predictions.append(output)
 
             teacher_force = random.random() < teacher_forcing_ratio
             if teacher_force:
@@ -89,10 +88,7 @@ class Seq2Seq(nn.Module):
             else:
                 inp = output
 
-            begin_symbol = torch.cat((begin_symbol, output), dim=1)
-
-        prediction = begin_symbol[:, 1:, :]
-        return prediction
+        return torch.cat(predictions, dim=1)
 
 
 class Discriminator(nn.Module):
@@ -168,6 +164,12 @@ class TaymouriAdversarialLSTM(nn.Module):
         cat_categories, _ = data_set_categories
         cat_input_feat_model, num_input_feat_model = model_feat
         cat_dict = {cat[0]: cat[1] for cat in cat_categories}
+        self.activity_feature_name = cat_categories[concept_name_id][0]
+        if self.activity_feature_name not in cat_input_feat_model:
+            raise ValueError(
+                f"Activity feature '{self.activity_feature_name}' must be part of model_feat categorical inputs."
+            )
+        self.activity_input_index = cat_input_feat_model.index(self.activity_feature_name)
 
         classes_per_cat = [cat_dict[feat] for feat in cat_input_feat_model if feat in cat_dict]
         if len(classes_per_cat) == 0:
@@ -245,6 +247,12 @@ class TaymouriAdversarialLSTM(nn.Module):
 
         return torch.cat((merged_cats, merged_nums), dim=-1)
 
+    def _build_start_input(self, prefixes):
+        """Build the first decoder input from the last prefix activity event."""
+        prefix_cats, _ = prefixes
+        activity_ids = prefix_cats[self.activity_input_index][:, -1].long()
+        return F.one_hot(activity_ids, self.output_size_act).float().unsqueeze(1)
+
     # -- forward / generation ------------------------------------------------
 
     def forward(self, prefixes, target_suffix=None, teacher_forcing_ratio: float = 0.0):
@@ -259,6 +267,7 @@ class TaymouriAdversarialLSTM(nn.Module):
             Activity logits with shape [S, B, output_size_act].
         """
         src = self._build_prefix_tensor(prefixes)
+        start_input = self._build_start_input(prefixes)
         batch_size = src.size(0)
         max_len = self.seq_len_pred
 
@@ -266,9 +275,9 @@ class TaymouriAdversarialLSTM(nn.Module):
             max_len = target_suffix.shape[1]
             trg = F.one_hot(target_suffix.long(), self.output_size_act).float()
         else:
-            trg = torch.ones(batch_size, max_len, self.output_size_act, device=src.device)
+            trg = torch.zeros(batch_size, max_len, self.output_size_act, device=src.device)
 
-        prediction = self.seq2seq(src, trg, teacher_forcing_ratio)  # [B, S, C]
+        prediction = self.seq2seq(src, trg, start_input, teacher_forcing_ratio)  # [B, S, C]
         return prediction.permute(1, 0, 2)  # [S, B, C]
 
     def discriminate(self, prefixes, suffix_activities):
@@ -317,9 +326,11 @@ class TaymouriAdversarialLSTM(nn.Module):
             h_b = h0[:, b : b + 1, :].contiguous()
             c_b = c0[:, b : b + 1, :].contiguous()
 
-            # begin_symbol = ones, matching the reference Seq2Seq
-            begin_inp = torch.ones(1, 1, C, device=device)
-            beams = [([], 0.0, begin_inp, h_b, c_b, False)]
+            start_inp = self._build_start_input((
+                [cat[b : b + 1] for cat in prefixes[0]],
+                [num[b : b + 1] for num in prefixes[1]],
+            ))
+            beams = [([], 0.0, start_inp, h_b, c_b, False)]
 
             for _ in range(max_len):
                 candidates = []
