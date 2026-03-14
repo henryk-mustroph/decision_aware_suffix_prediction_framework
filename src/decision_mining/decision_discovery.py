@@ -3,9 +3,9 @@ Compact, alignment-driven decision mining.
 Based on algorithm from:
 - De Leoni, and Van Der Aalst. "Data-aware process mining: discovering decisions in processes using alignments." ACM symposium on applied computing. 2013.
 
-- Adaptions:
-Use also historical events as input for decision mining
-
+Adaptions:
+- train the models to predict the next visible event, not a transition in the process model 
+- Use only and also historical events as input for decision mining
 """
 from __future__ import annotations
 
@@ -16,12 +16,10 @@ from pathlib import Path
 import json
 import pickle
 
-import re
 import numpy as np
 import pandas as pd
-from pm4py.visualization.petri_net import visualizer as pn_vis
-from decision_mining.function_estimator_catboost_advanced import FunctionEstimator as fe_advanced
 
+from decision_mining.function_estimator_catboost_advanced import FunctionEstimator as fe_advanced
 from decision_mining.function_estimator_catboost_advanced import ModelConfig as mc_advanced
 
 @dataclass
@@ -118,9 +116,6 @@ class DecisionDiscovery:
         """
         collect training data per decision place
         """
-        # big problem of algorithm: if (>>, None) is my log move, so a silent transition is fired: I do no know which transition it is: solved
-        # Now I have for each alignment a list of tuples: a tuple: (('>>', 'skip_2'), ('>>', None)) first element has name of transition taken
-
         # list of alignments: [[(('>>', 'skip_2'), ('>>', None)), (('>>', 'init_loop_3'), ('>>', None)), ... ], ...]
         
         # store train data for each transition place
@@ -189,13 +184,15 @@ class DecisionDiscovery:
 
                         if matched_event is not None:
                             ev_dict = matched_event.to_dict()
-                            event_attrs_past = self._filter_attributes(
-                                ev_dict, past_attr_keys
-                            )
+                            event_attrs_past = self._filter_attributes(ev_dict, past_attr_keys)
                             past_events.append(event_attrs_past)
         return I, legend
 
     def _build_feature_row(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        bulds train features
+        """
+        
         attrs = dict(attrs) if attrs else {}
         past_events = attrs.pop("past_events", [])
         features: Dict[str, Any] = dict(attrs)
@@ -225,14 +222,7 @@ class DecisionDiscovery:
             for key in sorted(summary_keys):
                 seq = [ev.get(key, np.nan) for ev in older_events]
 
-                valid_vals = [
-                    v
-                    for v in seq
-                    if not (
-                        v is None
-                        or (isinstance(v, (float, np.floating)) and np.isnan(v))
-                    )
-                ]
+                valid_vals = [v for v in seq if not ( v is None or (isinstance(v, (float, np.floating)) and np.isnan(v)))]
                 features[f"{key}_older_non_null_count"] = float(len(valid_vals))
 
                 if not valid_vals:
@@ -290,11 +280,12 @@ class DecisionDiscovery:
         return features
 
     def mine_decision_models(self,
-                             method: Optional[str] = 'basic',
                              dynamic_attributes: Optional[List[str]] = None,
                              static_attributes: Optional[List[str]] = None,
-                             mc_config = None) -> DecisionMiningResult:
-        # maybe add model config!
+                             mc_config = None) -> DecisionMiningResult:        
+        """
+        train and return decision modeles per decision place
+        """
         
         # train data and legend
         I, _legend = self.collect_I(dynamic_attributes=dynamic_attributes,
@@ -318,66 +309,18 @@ class DecisionDiscovery:
                 rows.append(self._build_feature_row(ass))
                 labels.append(str(chosen))
 
-            # only contains the past_event_counts as past data?
+            # only contains the past_event_counts as past data
             X_raw = pd.DataFrame(rows)
-           
-            if method == 'advanced':
-                est = fe_advanced.fit_from_xy(X_raw, labels, feature_cols=None, model_cfg=mc_config or mc_advanced())
-            else:
-                raise ValueError('Only basic and advanced exist!')
-
+            
+            est = fe_advanced.fit_from_xy(X_raw, labels, feature_cols=None, model_cfg=mc_config or mc_advanced())
             models[place_name] = DecisionPointModel(place_name=place_name, estimator=est)
 
         return DecisionMiningResult(models=models, skipped=skipped)
 
-    def debug_feature_preview(self,
-                              dynamic_attributes: Optional[List[str]] = None,
-                              static_attributes: Optional[List[str]] = None,
-                              max_rows_per_place: int = 1,
-                              print_rows: bool = True) -> Dict[str, pd.DataFrame]:
-        """
-        Build and optionally print a small preview of feature rows per decision place.
-
-        This helps validate that each branching sample uses only past events,
-        including previous-event data and older-history summaries.
-        """
-        I, _ = self.collect_I(
-            dynamic_attributes=dynamic_attributes,
-            static_attributes=static_attributes,
-        )
-
-        previews: Dict[str, pd.DataFrame] = {}
-        for place, samples in I.items():
-            place_name = str(place)
-            if not samples:
-                previews[place_name] = pd.DataFrame()
-                continue
-
-            rows: List[Dict[str, Any]] = []
-            labels: List[str] = []
-            for attrs, chosen in samples[:max_rows_per_place]:
-                rows.append(self._build_feature_row(attrs))
-                labels.append(str(chosen))
-
-            preview_df = pd.DataFrame(rows)
-            preview_df["target_activity"] = labels
-            previews[place_name] = preview_df
-
-            if print_rows:
-                print(f"\n=== Feature preview for {place_name} (showing {len(preview_df)} row(s)) ===")
-                if preview_df.empty:
-                    print("(no rows)")
-                else:
-                    with pd.option_context("display.max_columns", None, "display.width", 180):
-                        print(preview_df)
-
-        return previews
-
     def extract_guards(self,
                        mining_result: DecisionMiningResult,
                        *,
-                       use_advanced_estimator: bool = False,
-                       ) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+                       use_advanced_estimator: bool = False) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
         
         guards_by_place: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
         for place_name, model in mining_result.models.items():
@@ -400,24 +343,19 @@ class DecisionDiscovery:
 
         return guards_by_place
 
-    def save_results(
-        self,
-        *,
-        guards: Dict[str, Dict[str, List[Dict[str, Any]]]],
-        mining_result: Optional[DecisionMiningResult] = None,
-        feature_previews: Optional[Dict[str, pd.DataFrame]] = None,
-        output_dir: Optional[str] = None,
-        guards_json_path: Optional[str] = None,
-        guards_flat_csv_path: Optional[str] = None,
-        skipped_places_path: Optional[str] = None,
-        feature_preview_dir: Optional[str] = None,
-        per_place_json_path: Optional[str] = None,
-        model_dir: Optional[str] = None,
-    ) -> Dict[str, str]:
+    def save_results(self,
+                     *,
+                     guards: Dict[str, Dict[str, List[Dict[str, Any]]]],
+                     mining_result: Optional[DecisionMiningResult] = None,
+                     output_dir: Optional[str] = None,
+                     guards_json_path: Optional[str] = None,
+                     guards_flat_csv_path: Optional[str] = None,
+                     skipped_places_path: Optional[str] = None,
+                     per_place_json_path: Optional[str] = None,
+                     model_dir: Optional[str] = None) -> Dict[str, str]:
         """
         Persist mined decision artifacts to user-configurable paths.
-
-        Returns a dict with the concrete output paths written.
+        - Returns a dict with the concrete output paths written.
         """
         base_dir = Path(output_dir) if output_dir is not None else Path.cwd() / "decision_mining_results"
         base_dir.mkdir(parents=True, exist_ok=True)
@@ -425,25 +363,17 @@ class DecisionDiscovery:
         guards_json = Path(guards_json_path) if guards_json_path else base_dir / "guards.json"
         guards_csv = Path(guards_flat_csv_path) if guards_flat_csv_path else base_dir / "guards_flat.csv"
         skipped_csv = Path(skipped_places_path) if skipped_places_path else base_dir / "skipped_places.csv"
-        previews_dir = Path(feature_preview_dir) if feature_preview_dir else base_dir / "feature_previews"
         per_place_json = Path(per_place_json_path) if per_place_json_path else base_dir / "decision_places_bundle.json"
         models_dir = Path(model_dir) if model_dir else base_dir / "models"
 
         guards_json.parent.mkdir(parents=True, exist_ok=True)
         guards_csv.parent.mkdir(parents=True, exist_ok=True)
         skipped_csv.parent.mkdir(parents=True, exist_ok=True)
-        previews_dir.mkdir(parents=True, exist_ok=True)
         per_place_json.parent.mkdir(parents=True, exist_ok=True)
         models_dir.mkdir(parents=True, exist_ok=True)
 
         def _safe_name(name: str) -> str:
-            return (
-                str(name)
-                .replace("/", "_")
-                .replace("\\", "_")
-                .replace(" ", "_")
-                .replace(":", "_")
-            )
+            return (str(name).replace("/", "_").replace("\\", "_").replace(" ", "_").replace(":", "_"))
 
         def _incoming_transition_tuples(place_obj: Any) -> list[tuple[str, Optional[str]]]:
             if place_obj is None or not hasattr(place_obj, "in_arcs"):
@@ -469,9 +399,7 @@ class DecisionDiscovery:
                 deduped.append(item)
             return deduped
 
-        def _normalize_guards_for_json(
-            guard_dict: Dict[Any, Dict[Any, List[Dict[str, Any]]]]
-        ) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+        def _normalize_guards_for_json(guard_dict: Dict[Any, Dict[Any, List[Dict[str, Any]]]]) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
             normalized: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
             for place_key, by_label in guard_dict.items():
                 place_name = str(place_key)
@@ -486,8 +414,7 @@ class DecisionDiscovery:
         with guards_json.open("w", encoding="utf-8") as f:
             json.dump(guards_serializable, f, indent=2, ensure_ascii=False, default=str)
 
-        # 1b) Per-decision-place bundle:
-        # previous incoming transition tuple(s), trained model path, and guards.
+        # 1b) Per-decision-place bundle: previous incoming transition tuple(s), trained model path, and guards.
         per_place_records: list[dict[str, Any]] = []
         models_by_place = {} if mining_result is None else dict(mining_result.models)
         for place_key, guard_for_place in guards.items():
@@ -518,14 +445,7 @@ class DecisionDiscovery:
                 place_obj_for_arcs = getattr(model_obj, "place_name", None)
             previous_transitions = _incoming_transition_tuples(place_obj_for_arcs)
 
-            per_place_records.append(
-                {
-                    "place_name": place_name,
-                    "previous_transitions": previous_transitions,
-                    "model_path": model_path_str,
-                    "guards": guard_for_place,
-                }
-            )
+            per_place_records.append({"place_name": place_name, "previous_transitions": previous_transitions, "model_path": model_path_str, "guards": guard_for_place})
 
         with per_place_json.open("w", encoding="utf-8") as f:
             json.dump(per_place_records, f, indent=2, ensure_ascii=False, default=str)
@@ -535,56 +455,37 @@ class DecisionDiscovery:
         for place_name, by_label in guards.items():
             for activity_label, guard_list in by_label.items():
                 for g in guard_list:
-                    flat_rows.append(
-                        {
-                            "place_name": str(place_name),
-                            "activity_label": str(activity_label),
-                            "rule": g.get("rule", ""),
-                            "raw_rule": g.get("raw_rule", ""),
-                            "prob": g.get("prob", np.nan),
-                            "prob_model": g.get("prob_model", np.nan),
-                            "prob_emp": g.get("prob_emp", np.nan),
-                            "support": g.get("support", np.nan),
-                            "coverage": g.get("coverage", np.nan),
-                            "lift": g.get("lift", np.nan),
-                            "intervals": json.dumps(g.get("intervals", {}), ensure_ascii=False),
-                            "categorical_allowed": json.dumps(g.get("categorical_allowed", {}), ensure_ascii=False),
-                            "categorical_excluded": json.dumps(g.get("categorical_excluded", {}), ensure_ascii=False),
-                        }
-                    )
+                    flat_rows.append({"place_name": str(place_name),
+                                      "activity_label": str(activity_label),
+                                      "rule": g.get("rule", ""),
+                                      "raw_rule": g.get("raw_rule", ""),
+                                      "prob": g.get("prob", np.nan),
+                                      "prob_model": g.get("prob_model", np.nan),
+                                      "prob_emp": g.get("prob_emp", np.nan),
+                                      "support": g.get("support", np.nan),
+                                      "coverage": g.get("coverage", np.nan),
+                                      "lift": g.get("lift", np.nan),
+                                      "intervals": json.dumps(g.get("intervals", {}), ensure_ascii=False),
+                                      "categorical_allowed": json.dumps(g.get("categorical_allowed", {}), ensure_ascii=False),
+                                      "categorical_excluded": json.dumps(g.get("categorical_excluded", {}), ensure_ascii=False)})
         pd.DataFrame(flat_rows).to_csv(guards_csv, index=False)
 
         # 3) Skipped places
         skipped = [] if mining_result is None else list(mining_result.skipped)
-        pd.DataFrame({"skipped_place": [str(p) for p in skipped]}).to_csv(
-            skipped_csv, index=False
-        )
+        pd.DataFrame({"skipped_place": [str(p) for p in skipped]}).to_csv(skipped_csv, index=False)
 
-        # 4) Per-place feature previews (optional)
-        if feature_previews:
-            for place_name, preview_df in feature_previews.items():
-                safe_place_name = _safe_name(str(place_name))
-                preview_path = previews_dir / f"{safe_place_name}.csv"
-                preview_df.to_csv(preview_path, index=False)
-
-        return {
-            "output_dir": str(base_dir),
-            "guards_json_path": str(guards_json),
-            "guards_flat_csv_path": str(guards_csv),
-            "skipped_places_path": str(skipped_csv),
-            "feature_preview_dir": str(previews_dir),
-            "per_place_json_path": str(per_place_json),
-            "model_dir": str(models_dir),
-        }
+        return {"output_dir": str(base_dir),
+                "guards_json_path": str(guards_json),
+                "guards_flat_csv_path": str(guards_csv),
+                "skipped_places_path": str(skipped_csv),
+                "per_place_json_path": str(per_place_json),
+                "model_dir": str(models_dir)}
 
     def print_summary_and_visualize(self, guards: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> None:
-        """Print a summary and visualize the Petri net with activity-level decision rules.
+        """
+        Print a summary of event label decision rules.
 
-        Guards are keyed by **activity label** (the next visible activity
-        the decision model predicts), not by outgoing transition name.
-        The visualization highlights each decision place in blue and
-        attaches a separate "note" box with a compact rule summary via
-        a dotted connector.
+        Guards are keyed by event label (the next visible event the decision model predicts), not by outgoing transition name.
         """
 
         def _guard_prob(g: Dict[str, Any]) -> float:
@@ -619,17 +520,7 @@ class DecisionDiscovery:
                 parts.append("raw_rule=" + raw_rule)
             return "; ".join(parts)
 
-        def _best_rule_for_activity(guard_list):
-            if not guard_list:
-                return ""
-            best = max(guard_list, key=_guard_prob)
-            rule = best.get("rule", "")
-            prob = _guard_prob(best)
-            if rule and rule != "(true)":
-                return f"{rule} (p={prob:.2f})"
-            return f"p={prob:.2f}"
-
-        # --- Text summary ---
+        # Text summary
         for place_name, by_activity in guards.items():
             print(f"\n=== {place_name} ===")
             if not by_activity:
@@ -640,49 +531,15 @@ class DecisionDiscovery:
                 for g in guard_list:
                     print("    *", _format_guard(g))
 
-        # --- Petri net visualization ---
-        # Build compact annotation per decision place
-        place_annotations: Dict[str, str] = {}
-        for place_name, by_activity in guards.items():
-            lines = []
-            for activity_label, guard_list in by_activity.items():
-                summary = _best_rule_for_activity(guard_list)
-                lines.append(f"→{activity_label}: {summary}")
-            place_annotations[place_name] = "\n".join(lines)
-
-        # Blue-highlight decision places (keep short label = place name only)
-        decorations = {}
-        place_id_map: Dict[str, str] = {}  # place_name → graphviz node id
-        for p in self.net.places:
-            pname = str(p)
-            place_id_map[pname] = str(id(p))
-            if pname in place_annotations:
-                decorations[p] = {"label": pname, "color": "#dce6f1"}
-
-        params = {"decorations": decorations}
-        gviz = pn_vis.apply(self.net, self.im, self.fm, parameters=params)
-
-        # Post-process: attach rule annotation boxes to decision places
-        for pname, annotation in place_annotations.items():
-            node_id = place_id_map.get(pname)
-            if not node_id:
-                continue
-            note_id = f"rule_{pname}"
-            gviz.node(note_id, label=annotation,
-                      shape="note", style="filled", fillcolor="#ffffcc",
-                      fontsize="9", fontname="Helvetica")
-            gviz.edge(note_id, node_id,
-                      style="dotted", arrowhead="none", constraint="false")
-
-        pn_vis.view(gviz)
-
     def visualize_bpmn_with_rules(self, guards: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> None:
-        """Convert the Petri net to BPMN and annotate tasks with decision-rule notes.
+        """
+        Convert the Petri net to BPMN and annotate tasks with decision-rule notes.
+        
+        This is probably more suitable than the data-aware Petri net annotaiton, since we cannot annotate 
+        silent transitions but only real event label transitions. Silent transitions are not shown in a BPMN
 
-        Each task that appears as a predicted activity in the decision
-        models gets a "note" box (yellow) attached via a dotted line,
-        showing which decision places predict it and with what
-        probability / rule.
+        Each task that appears as a predicted activity in the decision models gets a "note" box (yellow)
+        attached via a dotted line, showing which decision places predict it and with what probability / rule.
         """
         from pm4py.objects.conversion.wf_net.variants import to_bpmn
         from pm4py.objects.bpmn.obj import BPMN as BPMNObj

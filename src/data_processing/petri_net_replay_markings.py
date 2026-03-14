@@ -5,9 +5,6 @@ import pm4py
 from pm4py.objects.conversion.log import converter as log_converter
 from pm4py.visualization.petri_net import visualizer as pn_visualizer
 from pm4py.objects.petri_net import semantics
-from pm4py.algo.conformance.tokenreplay import algorithm as token_replay
-from pm4py.objects.log.obj import Trace, Event
-from pm4py.objects.petri_net.obj import Marking
 
 class InductiveMiner:
     def __init__(self, path_to_csv_log, case_id_col="case:concept:name", activity_col="concept:name", timestamp_col="time:timestamp", resource_col="org:resource"):
@@ -54,9 +51,9 @@ class PNReplayMarkings:
         self.net, self.im, self.fm = discovered_pn
         self.prefix_df = prefix_df
         self.event_label = event_label
-    
-    # does not work currently
+
     def get_markings(self):
+        """Compute reached markings per prefix using transition lookup and PN semantics."""
         prefix_event_labels = self.prefix_df[self.event_label].tolist()
         markings = []
 
@@ -69,31 +66,12 @@ class PNReplayMarkings:
         for prefix in prefix_event_labels:
             current_marking = deepcopy(self.im)
             for label in prefix:
-                transitions = label_to_transitions[label]
+                transitions = label_to_transitions.get(label, [])
                 for transition in transitions:
                     if semantics.is_enabled(transition, self.net, current_marking):
                         current_marking = semantics.execute(transition, self.net, current_marking)
                         break
             markings.append(deepcopy(current_marking))
-
-        return markings
-
-    # uses token replay - works
-    def get_markings_token_replay(self):
-        prefix_event_labels = self.prefix_df[self.event_label].tolist()
-        markings = []
-
-        for prefix in prefix_event_labels:
-            trace_pref = Trace([Event({"concept:name": act}) for act in prefix])
-            replayed_traces = token_replay.apply(
-                log=[trace_pref],
-                net=self.net,
-                initial_marking=self.im,
-                final_marking=Marking(),
-            )
-            result = replayed_traces[0]
-            reached_marking = result["reached_marking"]
-            markings.append(reached_marking)
 
         return markings
         

@@ -5,19 +5,26 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+# performance imports for torch: torch kernel uses one core only.
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["TORCH_NUM_THREADS"] = "1" 
+
 import torch
 import torch.nn.functional as F
 from tqdm.notebook import tqdm
 
+# required files:
 from data_processing.decision_labeling import DecisionLabeler
-
-from .inference import Beam, Decoder, MCSA, Mode
+from .inference import Mode, Beam, MCSA
 
 
 @dataclass
 class DecisionGuidanceConfig:
-	"""Parameters for local decision-guided reweighting at inference."""
-
+	"""
+ 	Parameters for local decision-guided reweighting at inference.
+  	"""
 	epsilon: float = 1e-3
 	beta_max: float = 2.0
 	alpha: float = 0.1
@@ -25,7 +32,9 @@ class DecisionGuidanceConfig:
 
 
 class DecisionRuleGuidedMixin:
-	"""Shared decision-guidance and reasoning helpers for all decoders."""
+	"""
+ 	Shared decision-guidance and reasoning helpers for all decoders.
+  	"""
 
 	def _init_decision_guidance(
 		self,
@@ -109,6 +118,72 @@ class DecisionRuleGuidedMixin:
 				attrs[feature_name] = float(val)
 
 		return attrs
+
+	def _decode_event_attrs_from_suffix_step(
+		self,
+		suffix: Tuple[List[torch.Tensor], List[torch.Tensor]],
+		step_idx: int,
+		activity_id: int,
+		static_inputs: Any,
+	) -> Dict[str, Any]:
+		"""Build event attributes using predicted activity and GT non-activity attrs at step_idx."""
+		suffix_cats, suffix_nums = suffix
+		cat_ids: Dict[str, int] = {}
+		num_vals: Dict[str, float] = {}
+
+		for i, feature_name in enumerate(self._cat_feature_names):
+			if i == self.concept_name_id:
+				cat_ids[feature_name] = int(activity_id)
+				continue
+			if i >= len(suffix_cats) or step_idx >= suffix_cats[i].shape[1]:
+				continue
+			cat_ids[feature_name] = int(suffix_cats[i][0, step_idx].item())
+
+		for i, feature_name in enumerate(self._num_feature_names):
+			if i >= len(suffix_nums) or step_idx >= suffix_nums[i].shape[1]:
+				continue
+			num_vals[feature_name] = float(suffix_nums[i][0, step_idx].item())
+
+		next_event_attrs = self._decode_event_attrs_from_predicted_ids(
+			predicted_cat_ids=cat_ids,
+			predicted_num_values=num_vals,
+		)
+		next_event_attrs.update(self._extract_static_attrs(static_inputs))
+		return self.decision_labeler._filter_attributes(next_event_attrs)
+
+	def _roll_prefix_with_activity_from_suffix(
+		self,
+		prefix: Tuple[List[torch.Tensor], List[torch.Tensor]],
+		suffix: Tuple[List[torch.Tensor], List[torch.Tensor]],
+		step_idx: int,
+		activity_id: int,
+	) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+		"""Roll prefix and append predicted activity with GT non-activity attributes at step_idx."""
+		prefix_cats, prefix_nums = prefix
+		suffix_cats, suffix_nums = suffix
+
+		new_cats: List[torch.Tensor] = []
+		for i, cat in enumerate(prefix_cats):
+			shifted = torch.roll(cat.clone(), shifts=-1, dims=1)
+			if i == self.concept_name_id:
+				shifted[:, -1] = activity_id
+			else:
+				if step_idx < suffix_cats[i].shape[1]:
+					shifted[:, -1] = suffix_cats[i][:, step_idx]
+				else:
+					shifted[:, -1] = 0
+			new_cats.append(shifted)
+
+		new_nums: List[torch.Tensor] = []
+		for i, num in enumerate(prefix_nums):
+			shifted = torch.roll(num.clone(), shifts=-1, dims=1)
+			if step_idx < suffix_nums[i].shape[1]:
+				shifted[:, -1] = suffix_nums[i][:, step_idx]
+			else:
+				shifted[:, -1] = num[:, -1]
+			new_nums.append(shifted)
+
+		return (new_cats, new_nums)
 
 	def _extract_static_attrs(self, static_inputs: Any) -> Dict[str, Any]:
 		if static_inputs is None:
@@ -484,7 +559,14 @@ class GuidedMCSA(DecisionRuleGuidedMixin, MCSA):
 			decision_places_bundle_path=decision_places_bundle_path,
 		)
 
-	def sample_suffix(self, prefix, prefix_len, static_inputs, mask, include_model_states=False, return_reasoning=False):
+	def sample_suffix(self,
+					 prefix,
+					 prefix_len,
+					 static_inputs,
+					 mask,
+					 suffix=None,
+					 include_model_states=False,
+					 return_reasoning=False):
 		prediction, (h, c), z = self.model.inference(
 			prefix=prefix,
 			static_inputs=static_inputs,
@@ -555,14 +637,22 @@ class GuidedMCSA(DecisionRuleGuidedMixin, MCSA):
 			if include_model_states:
 				model_states.append((h, c))
 
-			predicted_ids: Dict[str, int] = {}
-			for key, value in cat_predictions.items():
-				feature_name = key[:-5] if key.endswith("_mean") else key
-				predicted_ids[feature_name] = int(value.item())
+			if suffix is not None:
+				next_event_attrs = self._decode_event_attrs_from_suffix_step(
+					suffix=suffix,
+					step_idx=step_idx,
+					activity_id=sampled_activity_id,
+					static_inputs=static_inputs,
+				)
+			else:
+				predicted_ids: Dict[str, int] = {}
+				for key, value in cat_predictions.items():
+					feature_name = key[:-5] if key.endswith("_mean") else key
+					predicted_ids[feature_name] = int(value.item())
 
-			next_event_attrs = self._decode_event_attrs_from_predicted_ids(predicted_ids)
-			next_event_attrs.update(self._extract_static_attrs(static_inputs))
-			next_event_attrs = self.decision_labeler._filter_attributes(next_event_attrs)
+				next_event_attrs = self._decode_event_attrs_from_predicted_ids(predicted_ids)
+				next_event_attrs.update(self._extract_static_attrs(static_inputs))
+				next_event_attrs = self.decision_labeler._filter_attributes(next_event_attrs)
 			past_events.append(next_event_attrs)
 
 			next_event = (list(cat_predictions.values()), [])
@@ -585,6 +675,20 @@ class GuidedMCSA(DecisionRuleGuidedMixin, MCSA):
 			return sampled_suffix, model_states
 		return sampled_suffix
 
+	def predict_probabilistic_suffix(self, prefix, prefix_len, static_inputs, mask, suffix=None, include_model_states=False):
+		suffixes = []
+		for _ in range(self.samples_per_case):
+			suffixes.append(
+				self.sample_suffix(
+					prefix=prefix,
+					prefix_len=prefix_len,
+					static_inputs=static_inputs,
+					mask=mask,
+					suffix=suffix,
+					include_model_states=include_model_states)
+			)
+		return suffixes
+
 	def evaluate(self, random_order=False, include_model_states=False, return_reasoning=False):
 		self._ensure_eval_mode()
 		case_items = list(self.cases.items())
@@ -604,6 +708,7 @@ class GuidedMCSA(DecisionRuleGuidedMixin, MCSA):
 						prefix_len=prefix_len,
 						static_inputs=statics,
 						mask=zero_mask,
+						suffix=suffix,
 						include_model_states=include_model_states,
 					)
 					yield (case_name, prefix_len, prefix_activity, target_suffix, sampled_suffixes)
@@ -617,6 +722,7 @@ class GuidedMCSA(DecisionRuleGuidedMixin, MCSA):
 						prefix_len=prefix_len,
 						static_inputs=statics,
 						mask=zero_mask,
+						suffix=suffix,
 						include_model_states=False,
 						return_reasoning=True,
 					)
@@ -681,7 +787,7 @@ class GuidedBeam(DecisionRuleGuidedMixin, Beam):
 
 		return (new_cats, new_nums)
 
-	def decode_suffix(self, prefix, prefix_len, static_inputs=None, return_reasoning=False):
+	def decode_suffix(self, prefix, suffix, prefix_len, static_inputs=None, return_reasoning=False):
 		max_iteration = (
 			self.dataset.encoder_decoder.window_size
 			- self.dataset.encoder_decoder.min_suffix_size
@@ -768,10 +874,13 @@ class GuidedBeam(DecisionRuleGuidedMixin, Beam):
 								}
 							)
 
-						new_prefix = self._roll_prefix_activity_only(beam["prefix"], tok)
-						next_attrs = self._decode_event_attrs_from_predicted_ids(
-							{self.dataset.all_categories[0][self.concept_name_id][0]: tok}
+						new_prefix = self._roll_prefix_with_activity_from_suffix(
+							prefix=beam["prefix"],
+							suffix=suffix,
+							step_idx=step_idx,
+							activity_id=tok,
 						)
+						next_attrs = self._decode_event_attrs_from_prefix_last(new_prefix)
 						next_attrs.update(static_attrs)
 						next_attrs = self.decision_labeler._filter_attributes(next_attrs)
 						new_past_events.append(next_attrs)
@@ -837,27 +946,26 @@ class GuidedBeam(DecisionRuleGuidedMixin, Beam):
 				if return_reasoning:
 					decoded_suffixes, reasonings = self.decode_suffix(
 						prefix=prefix,
+						suffix=suffix,
 						prefix_len=prefix_len,
 						static_inputs=statics,
 						return_reasoning=True,
 					)
 					yield (case_name, prefix_len, prefix_activity, target_suffix, decoded_suffixes, reasonings)
 				else:
-					decoded_suffixes = self.decode_suffix(prefix=prefix, prefix_len=prefix_len, static_inputs=statics)
+					decoded_suffixes = self.decode_suffix(prefix=prefix, suffix=suffix, prefix_len=prefix_len, static_inputs=statics)
 					yield (case_name, prefix_len, prefix_activity, target_suffix, decoded_suffixes)
 
 
-def get_decision_guided_evaluator(
-	kind: str,
-	model,
-	dataset,
-	decision_labeler: DecisionLabeler,
-	guidance_config: Optional[DecisionGuidanceConfig] = None,
-	decision_places_bundle_path: Optional[str] = None,
-	**kwargs,
-):
-	"""Factory for decision-rule-guided evaluators.
-
+def get_decision_guided_evaluator(kind: str,
+                                  model,
+                                  dataset,
+                                  decision_labeler: DecisionLabeler,
+                                  guidance_config: Optional[DecisionGuidanceConfig] = None,
+                                  decision_places_bundle_path: Optional[str] = None,
+                                  **kwargs):
+	"""
+ 	Factory for decision-rule-guided evaluators.
 	Supported kinds:
 	- "mcsa": guided Monte-Carlo suffix sampling
 	- "mode": guided arg-max decoding

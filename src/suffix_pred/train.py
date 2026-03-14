@@ -1,10 +1,10 @@
 """
-Comprehensive efficient auto-regressive training for event (label)-sequence prediction
 Training approaches from 3 different methods:
 1) Mode (Arg-Max): LSTM,
 2) Beam-Search (fixed n beam size): LSTM
 3) Monte Carlo Suffix sampling: LSTM.
 
+# 
 """
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -115,6 +115,7 @@ class Trainer:
 
         return (static_cat, static_num)
 
+    # for U-ED-LSTM and T-GAN-LSTM
     def _split_prefix_suffix(self, cats, nums, suffix_size):
         prefixes_cat = [cat[:, :-suffix_size].to(self.device) for cat in cats]
         prefixes_num = [num[:, :-suffix_size].to(self.device) for num in nums]
@@ -122,12 +123,14 @@ class Trainer:
         suffixes_num = [num[:, -suffix_size:].to(self.device) for num in nums]
         return [prefixes_cat, prefixes_num], [suffixes_cat, suffixes_num]
 
+    # for C-LSTM
     def _split_prefix_and_next_activity(self, cats, nums, concept_name_id):
         prefixes_cat = [cat[:, :-1].to(self.device) for cat in cats]
         prefixes_num = [num[:, :-1].to(self.device) for num in nums]
         target_act = cats[concept_name_id][:, -1].to(self.device).long()
         return [prefixes_cat, prefixes_num], target_act
 
+    # zero padding and eos padding masks (Optional)
     def _build_masks(self, eos_paddings, zero_paddings, suffix_size, use_zero_padd_masking, use_eos_padd_masking):
         prefix_mask = None
         eos_paddings_suffix = None
@@ -147,14 +150,14 @@ class Trainer:
 
         return prefix_mask, eos_paddings_suffix
 
-    def _scheduled_sampling_rates(self, step_index, epsilon_max, inverse_sigmoid_k,
-                                  min_teacher_forcing=0.0):
+    # 
+    def _scheduled_sampling_rates(self, step_index, epsilon_max, inverse_sigmoid_k, min_teacher_forcing=0.0):
         """
         Inverse-sigmoid scheduled sampling.
 
         Returns:
-            epsilon: probability of feeding model prediction.
-            teacher_forcing_ratio: probability of feeding ground truth.
+        - epsilon: probability of feeding model prediction.
+        - teacher_forcing_ratio: probability of feeding ground truth.
         """
         k = max(1e-6, float(inverse_sigmoid_k))
         t = float(step_index)
@@ -170,18 +173,18 @@ class Trainer:
         epsilon = 1.0 - teacher_forcing_ratio
         return epsilon, teacher_forcing_ratio
 
+    # 
     def _extract_guard_suffix(self, guard_targets, guard_mask, suffix_size, guard_confidence=None):
         """
         Extract guard data aligned with decoder input events.
 
-        At decoder step s the model consumes e_{k+s} (for s=0 = last prefix
-        event) and predicts e_{k+s+1}.  The guard label for step s is
-        therefore the label of event at position T-S-1+s.
+        At decoder step s the model consumes e_{k+s} (for s=0 = last prefix event) and predicts e_{k+s+1}.  
+        The guard label for step s is therefore the label of event at position T-S-1+s.
 
         Returns:
-            guard_suffix_targets  : [B, S, C] or None
-            guard_suffix_mask     : [B, S] or None
-            guard_suffix_conf     : [B, S] or None
+        - guard_suffix_targets  : [B, S, C] or None
+        - guard_suffix_mask     : [B, S] or None
+        - guard_suffix_conf     : [B, S] or None
         """
         if guard_targets.shape[-1] == 0:
             return None, None, None
@@ -194,7 +197,7 @@ class Trainer:
         return guard_suffix_targets, guard_suffix_mask, guard_suffix_conf
 
 
-# Trainer for the U-ED-LSTM: 
+# Trainer for the U-ED-LSTM (with and without decision-awareness): 
 class KTrainer(Trainer):
     def __init__(self,
                  device,
@@ -208,27 +211,7 @@ class KTrainer(Trainer):
                  lambda_g: float = 0.0,
                  save_model_n_th_epoch: int = 0,
                  saving_path: str = 'U_ED_LSTM_train.pkl'):
-        """        
-        Args:
-        - device: Device (GPU or CPU).
-        - model: Model that is trained and validated.
-        - data_train: Training data.
-        - data_val: Validation data.
-        - loss_obj: object for loss functions
-        - log_normal_loss_num_feature: list of strings of num feaures that follow log normal distribution.
-        - optimize_values:
-            - regularization_term: L2 regularization for weights, biases, and dropout of stochastic model. 
-            - optimizer: Optimization algorithm for training.
-            - epochs: Epochs the model trains the full training dataset.
-            - mini_batches: Batches the model get passed at once.
-            - shuffles: Shuffle batches.
-            - min teacher_forcing_ratio: Value [0,1) that is used to decide if predicted or next target event is used for next prediction by model.
-            - max teacher_forcing_ratio: Value [0,1) that is used to decide if predicted or next target event is used for next prediction by model.
-        - suffix_data_split_value: Number of last values of suffix events. 
-        - save_model_n_th_epoch: int,
-        - saving_path: str, default: 'model.pkl'
-        """
-
+        
         # Standard Training parameters
         super().__init__(device=device,
                          model=model,
@@ -261,10 +244,8 @@ class KTrainer(Trainer):
         # Teacher forcing
         self.min_teacher_forcing_value = optimize_values["min_teacher_forcing_value"]
         self.max_teacher_forcing_value = optimize_values["max_teacher_forcing_value"]
-        self.scheduled_sampling_epsilon_max = optimize_values.get(
-            "scheduled_sampling_epsilon_max", self.max_teacher_forcing_value)
-        self.scheduled_sampling_k = optimize_values.get(
-            "scheduled_sampling_k", max(1.0, self.epochs / 10.0))
+        self.scheduled_sampling_epsilon_max = optimize_values.get("scheduled_sampling_epsilon_max", self.max_teacher_forcing_value)
+        self.scheduled_sampling_k = optimize_values.get("scheduled_sampling_k", max(1.0, self.epochs / 10.0))
         
         # Events in sufffix: Dependent on data set
         self.suffix_data_split_value = suffix_data_split_value
@@ -362,8 +343,10 @@ class KTrainer(Trainer):
                                                                      use_eos_padd_masking=use_eos_padd_masking)
 
                 # Guard data aligned to decoder steps
-                guard_suffix_targets, guard_suffix_mask, guard_suffix_conf = self._extract_guard_suffix(
-                    guard_targets, guard_mask, self.suffix_data_split_value, guard_confidence=guard_confidence)
+                guard_suffix_targets, guard_suffix_mask, guard_suffix_conf = self._extract_guard_suffix(guard_targets,
+                                                                                                        guard_mask,
+                                                                                                        self.suffix_data_split_value,
+                                                                                                        guard_confidence=guard_confidence)
 
                 # Optimization (categorical only)
                 cat_losses_dict, loss_value = self.train_epoch(prefixes=prefixes,
@@ -373,8 +356,7 @@ class KTrainer(Trainer):
                                                                static_inputs=static_inputs,
                                                                guard_targets=guard_suffix_targets,
                                                                guard_mask=guard_suffix_mask,
-                                                               guard_confidence=guard_suffix_conf,
-                                                               )
+                                                               guard_confidence=guard_suffix_conf)
                 
                 # Loss calculation and output
                 # Accumulate the categorical losses

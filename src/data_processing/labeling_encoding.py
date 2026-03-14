@@ -1618,61 +1618,46 @@ class EventLogLoader:
         encoded_data, all_categories, all_static_categories = self.encoder_decoder.encode_df(df)
         return EventLogDataset(encoded_data, all_categories, all_static_categories, self.encoder_decoder)
 
-    def label_dataset(
-        self,
-        dataset: EventLogDataset,
-        *,
-        petri_net: Tuple,
-        decision_model_dir: str,
-        decision_places_bundle_path: str,
-        dynamic_attributes: Optional[List[str]] = None,
-        static_attributes: Optional[List[str]] = None,
-        event_log_df: Optional[pd.DataFrame] = None,
-        sorted_case_ids: Optional[List[str]] = None,
-        alignments: Optional[List] = None,
-        mode: str = "offline",
-    ) -> None:
+    #
+    # New: label dataset for decision-aware training:
+    #
+    def label_dataset(self,
+                      dataset: EventLogDataset,
+                      *,
+                      petri_net: Tuple,
+                      decision_model_dir: str,
+                      decision_places_bundle_path: str,
+                      dynamic_attributes: Optional[List[str]] = None,
+                      static_attributes: Optional[List[str]] = None,
+                      event_log_df: Optional[pd.DataFrame] = None,
+                      sorted_case_ids: Optional[List[str]] = None,
+                      alignments: Optional[List] = None,
+                      mode: str = "offline") -> None:
         """
-        Apply decision-aware labeling to a dataset in-place.
+        Apply decision-aware offline labeling to a dataset in-place.
 
-        Parameters
-        ----------
-        dataset : EventLogDataset: The dataset to label (modified in-place via ``set_decision_data``).
-        petri_net : tuple: ``(net, initial_marking, final_marking)``.
-        decision_model_dir : str: Directory with per-place ``.pkl`` estimator files.
-        decision_places_bundle_path : str
-            Path to ``decision_places_bundle.json``.
-        dynamic_attributes, static_attributes : list[str] | None
-            Same attribute lists used during decision mining.
-        event_log_df : pd.DataFrame | None
-            Raw event log (with timestamps and attributes). Required for
-            offline mode; used in online mode for attribute lookup.
-        sorted_case_ids : list[str] | None
-            Case IDs in the same order as *alignments*. Required for offline.
-        alignments : list | None
-            Optimal alignments from pm4py. Required for offline mode.
-        mode : str
-            ``"offline"`` (training, uses alignments) or
-            ``"online"`` (inference, uses token-based replay).
+        Inputs:
+        - dataset : EventLogDataset: The dataset to label (modified in-place via set_decision_data).
+        - petri_net : tuple: (net, initial_marking, final_marking).
+        - decision_model_dir : str: Directory with per-place ``.pkl`` estimator files.
+        - decision_places_bundle_path : str Path to decision_places_bundle.json.
+        - dynamic_attributes, static_attributes : list[str] | None: Same attribute lists used during decision mining.
+        - event_log_df : pd.DataFrame | None: Raw event log (with timestamps and attributes). Required for offline mode.
+        - sorted_case_ids : list[str] | None
+        - Case IDs in the same order as *alignments*. Required for offline.
+        - alignments : list | None: Optimal alignments from pm4py. Required for offline mode.
+        - mode : str: Only "offline" is supported. Inference-time decision guidance is performed on-the-fly during decoding and no pre-labeling is applied to test prefixes.
         """
-        labeler = DecisionLabeler(
-            petri_net=petri_net,
-            decision_model_dir=decision_model_dir,
-            decision_places_bundle_path=decision_places_bundle_path,
-            dynamic_attributes=dynamic_attributes,
-            static_attributes=static_attributes,
-        )
+        labeler = DecisionLabeler(petri_net=petri_net, 
+                                  decision_model_dir=decision_model_dir,
+                                  decision_places_bundle_path=decision_places_bundle_path,
+                                  dynamic_attributes=dynamic_attributes,
+                                  static_attributes=static_attributes)
 
-        if mode == "offline":
-            if event_log_df is None or sorted_case_ids is None or alignments is None:
-                raise ValueError(
-                    "event_log_df, sorted_case_ids, and alignments are required "
-                    "for offline labeling"
-                )
-            labeler.label_dataset_offline(
-                dataset, event_log_df, sorted_case_ids, alignments
+        if mode != "offline":
+            raise ValueError("mode must be 'offline'. Pre-labeling test prefixes before decoding is disabled by design.")
+
+        if event_log_df is None or sorted_case_ids is None or alignments is None:
+            raise ValueError("event_log_df, sorted_case_ids, and alignments are required for offline labeling"
             )
-        elif mode == "online":
-            labeler.label_dataset_online(dataset, event_log_df)
-        else:
-            raise ValueError("mode must be 'offline' or 'online'")
+        labeler.label_dataset_offline(dataset, event_log_df, sorted_case_ids, alignments)
