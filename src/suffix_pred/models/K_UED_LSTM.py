@@ -1,9 +1,6 @@
 """
 According to:
-M. Kunkler, H. Mustroph and S. Rinderle-Ma,
-"Probabilistic Suffix Prediction of Business Processes,
-International Conference on Process Mining (ICPM) 2025,
-doi: 10.1109/ICPM66919.2025.11220650.
+M. Kunkler, H. Mustroph and S. Rinderle-Ma, "Probabilistic Suffix Prediction of Business Processes, International Conference on Process Mining (ICPM) 2025, doi: 10.1109/ICPM66919.2025.11220650.
 """
 
 import os
@@ -12,7 +9,6 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["TORCH_NUM_THREADS"] = "1"
 import torch
 from torch import Tensor, nn
-
 from typing import List, Optional, Tuple, Union
 
 class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
@@ -358,7 +354,8 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
                 static_inputs: Optional[Union[Tensor, List, Tuple, dict]] = None,
                 suffixes: Optional[List] = None,
                 teacher_forcing_ratio: Optional[float] = 0.0,
-                prefix_mask: Optional[Tensor] = None):
+                prefix_mask: Optional[Tensor] = None,
+                return_teacher_forcing_mask: Optional[bool] = False):
         """
         Full forward pass through the Encoder-Decoder architecture.
 
@@ -400,49 +397,41 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
 
         # Training
         if training:
+            batch_size = cat_prefixes[0].shape[0]
+            tf_mask = torch.zeros(batch_size, self.seq_len_pred, device=cat_prefixes[0].device)
             # Timestep iterations: 0, 1, ..., n-1
             for t in range(self.seq_len_pred):
                 # SOS Event
                 if t == 0:
                     # preds: list containing two dicts one for all means (cat, num),
                     # one for all vars (cat, num)
-                    preds, (h, c), z = self.decoder(
-                        input=sos_event, hx=(h_enc, c_enc), z=None, pred=False
-                    )
+                    preds, (h, c), z = self.decoder(input=sos_event, hx=(h_enc, c_enc), z=None, pred=False)
                     pred_means, pred_vars = preds
 
                 # Next Event
                 # Decide per timestep whether to use teacher forcing
                 else:
-                    # Random value for teacher forcing for each timestep: If smaller use
-                    # target else predicted. For high teacher forcing use target
-                    if torch.rand(1).item() < teacher_forcing_ratio:
+                    # Random value for teacher forcing for each timestep: If smaller use target else predicted. For high teacher forcing use target
+                    teacher_force = torch.rand(1).item() < teacher_forcing_ratio
+                    if teacher_force:
+                        tf_mask[:, t] = 1.0
                         # Use ground-truth previous event
-                        cat_t_suffix_event = [
-                            cat_tens[:, t - 1 : t] for cat_tens in suffixes[0]
-                        ]
-                        num_t_suffix_event = [
-                            num_tens[:, t - 1 : t] for num_tens in suffixes[1]
-                        ]
+                        cat_t_suffix_event = [cat_tens[:, t - 1 : t] for cat_tens in suffixes[0]]
+                        num_t_suffix_event = [num_tens[:, t - 1 : t] for num_tens in suffixes[1]] 
+                        
                         t_suffix_event = [cat_t_suffix_event, num_t_suffix_event]
 
-                        preds, (h, c), _ = self.decoder(
-                            input=t_suffix_event, hx=(h, c), z=z, pred=False
-                        )
+                        preds, (h, c), _ = self.decoder(input=t_suffix_event, hx=(h, c), z=z, pred=False)
                         pred_means, pred_vars = preds
 
                     else:
                         # Use model prediction
-                        last_pred_event = self.__transform_pred_into_next_event(
-                            pred_means=pred_means, pred_index=t, suffix=suffixes
-                        )
+                        last_pred_event = self.__transform_pred_into_next_event(pred_means=pred_means, pred_index=t, suffix=suffixes)
                         # For prediction, we assume valid input (or we could carry over
                         # mask if we wanted to propagate padding)
                         # But usually we don't mask predictions during generation unless
                         # we track finished state.
-                        preds, (h, c), _ = self.decoder(
-                            input=last_pred_event, hx=(h, c), z=z, pred=True
-                        )
+                        preds, (h, c), _ = self.decoder(input=last_pred_event, hx=(h, c), z=z, pred=True)
                         pred_means, pred_vars = preds
 
                 cat_pred_means, _ = pred_means
@@ -451,43 +440,21 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
                 # Add categorical tensors to output
                 for key in cat_output_features_labels:
                     if t == 0:
-                        predictions[0][f"{key}_mean"] = cat_pred_means[
-                            f"{key}_mean"
-                        ].unsqueeze(0)
-                        predictions[0][f"{key}_var"] = cat_pred_vars[
-                            f"{key}_var"
-                        ].unsqueeze(0)
+                        predictions[0][f"{key}_mean"] = cat_pred_means[f"{key}_mean"].unsqueeze(0)
+                        predictions[0][f"{key}_var"] = cat_pred_vars[f"{key}_var"].unsqueeze(0)
                     else:
-                        predictions[0][f"{key}_mean"] = torch.cat(
-                            (
-                                predictions[0][f"{key}_mean"],
-                                cat_pred_means[f"{key}_mean"].unsqueeze(0),
-                            ),
-                            dim=0,
-                        )
-                        predictions[0][f"{key}_var"] = torch.cat(
-                            (
-                                predictions[0][f"{key}_var"],
-                                cat_pred_vars[f"{key}_var"].unsqueeze(0),
-                            ),
-                            dim=0,
-                        )
+                        predictions[0][f"{key}_mean"] = torch.cat((predictions[0][f"{key}_mean"], cat_pred_means[f"{key}_mean"].unsqueeze(0)),dim=0)
+                        predictions[0][f"{key}_var"] = torch.cat((predictions[0][f"{key}_var"], cat_pred_vars[f"{key}_var"].unsqueeze(0)), dim=0)
 
         # Validation:
         if validation:
             for k in range(self.seq_len_pred):
                 if k == 0:
-                    preds, (h, c), z = self.decoder(
-                        input=sos_event, hx=(h_enc, c_enc), z=None, pred=False
-                    )
+                    preds, (h, c), z = self.decoder(input=sos_event, hx=(h_enc, c_enc), z=None, pred=False)
                     pred_means, pred_vars = preds
                 else:
-                    last_pred_event = self.__transform_pred_into_next_event(
-                        pred_means=pred_means
-                    )
-                    preds, (h, c), z = self.decoder(
-                        input=last_pred_event, hx=(h, c), z=z, pred=True
-                    )
+                    last_pred_event = self.__transform_pred_into_next_event(pred_means=pred_means)
+                    preds, (h, c), z = self.decoder(input=last_pred_event, hx=(h, c), z=z, pred=True)
                     pred_means, pred_vars = preds
 
                 cat_pred_means, _ = pred_means
@@ -496,29 +463,19 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
                 # Add categorical tensors to output
                 for key in cat_output_features_labels:
                     if k == 0:
-                        predictions[0][f"{key}_mean"] = cat_pred_means[
-                            f"{key}_mean"
-                        ].unsqueeze(0)
-                        predictions[0][f"{key}_var"] = cat_pred_vars[
-                            f"{key}_var"
-                        ].unsqueeze(0)
+                        predictions[0][f"{key}_mean"] = cat_pred_means[f"{key}_mean"].unsqueeze(0)
+                        predictions[0][f"{key}_var"] = cat_pred_vars[f"{key}_var"].unsqueeze(0)
                     else:
-                        predictions[0][f"{key}_mean"] = torch.cat(
-                            (
-                                predictions[0][f"{key}_mean"],
-                                cat_pred_means[f"{key}_mean"].unsqueeze(0),
-                            ),
-                            dim=0,
-                        )
-                        predictions[0][f"{key}_var"] = torch.cat(
-                            (
-                                predictions[0][f"{key}_var"],
-                                cat_pred_vars[f"{key}_var"].unsqueeze(0),
-                            ),
-                            dim=0,
-                        )
+                        predictions[0][f"{key}_mean"] = torch.cat((predictions[0][f"{key}_mean"],
+                                                                   cat_pred_means[f"{key}_mean"].unsqueeze(0)),
+                                                                 dim=0)
+                        predictions[0][f"{key}_var"] = torch.cat((predictions[0][f"{key}_var"], cat_pred_vars[f"{key}_var"].unsqueeze(0)),
+                                                                 dim=0)
 
         # Return training or validation output
+        if training and return_teacher_forcing_mask:
+            return predictions, (h, c), self.seq_len_pred, self.output_feature_indeces, tf_mask
+
         return predictions, (h, c), self.seq_len_pred, self.output_feature_indeces
 
     def __transform_pred_into_next_event(self,

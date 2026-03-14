@@ -72,11 +72,12 @@ class Seq2Seq(nn.Module):
         assert encoder.n_layers == decoder.n_layers, \
             "Encoder and decoder must have equal number of layers!"
 
-    def forward(self, src, trg, start_input, teacher_forcing_ratio=0.5):
+    def forward(self, src, trg, start_input, teacher_forcing_ratio=0.5, return_teacher_forcing_mask: bool = False):
         hidden, cell = self.encoder(src)
 
         predictions = []
         inp = start_input
+        tf_mask = torch.zeros(trg.size(0), trg.size(1), device=src.device)
 
         for i in range(trg.size(1)):
             output, hidden, cell = self.decoder(inp, hidden, cell)
@@ -84,11 +85,15 @@ class Seq2Seq(nn.Module):
 
             teacher_force = random.random() < teacher_forcing_ratio
             if teacher_force:
+                tf_mask[:, i] = 1.0
                 inp = trg[:, i, :].view((trg.size(0), 1, trg.size(2)))
             else:
                 inp = output
 
-        return torch.cat(predictions, dim=1)
+        prediction = torch.cat(predictions, dim=1)
+        if return_teacher_forcing_mask:
+            return prediction, tf_mask
+        return prediction
 
 
 class Discriminator(nn.Module):
@@ -255,7 +260,8 @@ class TaymouriAdversarialLSTM(nn.Module):
 
     # -- forward / generation ------------------------------------------------
 
-    def forward(self, prefixes, target_suffix=None, teacher_forcing_ratio: float = 0.0):
+    def forward(self, prefixes, target_suffix=None, teacher_forcing_ratio: float = 0.0,
+                return_teacher_forcing_mask: bool = False):
         """
         Args:
             prefixes: [cats_list, nums_list] — prefix event features.
@@ -277,7 +283,17 @@ class TaymouriAdversarialLSTM(nn.Module):
         else:
             trg = torch.zeros(batch_size, max_len, self.output_size_act, device=src.device)
 
-        prediction = self.seq2seq(src, trg, start_input, teacher_forcing_ratio)  # [B, S, C]
+        seq2seq_output = self.seq2seq(src,
+                                      trg,
+                                      start_input,
+                                      teacher_forcing_ratio,
+                                      return_teacher_forcing_mask=return_teacher_forcing_mask)
+
+        if return_teacher_forcing_mask:
+            prediction, tf_mask = seq2seq_output
+            return prediction.permute(1, 0, 2), tf_mask  # [S, B, C], [B, S]
+
+        prediction = seq2seq_output
         return prediction.permute(1, 0, 2)  # [S, B, C]
 
     def discriminate(self, prefixes, suffix_activities):

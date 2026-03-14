@@ -105,12 +105,17 @@ class Loss:
         return L
 
     # correcte
-    def guard_cross_entropy(self, pred_logits, guard_targets, guard_mask,
-                            eos_paddings=None, next_event_targets=None,
-                            guard_confidence=None, support_threshold=0.0):
+    def guard_KL_loss(self, 
+                      pred_logits,
+                      guard_targets,
+                      guard_mask,
+                      eos_paddings=None,
+                      next_event_targets=None,
+                      guard_confidence=None,
+                      teacher_forcing_mask=None,
+                      support_threshold=0.0):
         """
         Decision-aware guard KL loss (L_guard).
-
         Computes a weighted KL divergence between the thresholded and renormalized decision-model distribution q and the predicted next-event-label distribution.
 
         Inputs:
@@ -160,6 +165,11 @@ class Loss:
         # Optional EOS masking.
         if eos_paddings is not None:
             weight = weight * eos_paddings
+
+        # Optional teacher-forcing masking: regularize only decoder steps
+        # that consumed ground-truth next-event inputs.
+        if teacher_forcing_mask is not None:
+            weight = weight * teacher_forcing_mask
 
         weighted = per_step_kl * weight
 

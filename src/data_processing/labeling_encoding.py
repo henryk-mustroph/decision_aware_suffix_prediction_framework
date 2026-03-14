@@ -1658,6 +1658,6 @@ class EventLogLoader:
             raise ValueError("mode must be 'offline'. Pre-labeling test prefixes before decoding is disabled by design.")
 
         if event_log_df is None or sorted_case_ids is None or alignments is None:
-            raise ValueError("event_log_df, sorted_case_ids, and alignments are required for offline labeling"
-            )
+            raise ValueError("event_log_df, sorted_case_ids, and alignments are required for offline labeling")
+        
         labeler.label_dataset_offline(dataset, event_log_df, sorted_case_ids, alignments)

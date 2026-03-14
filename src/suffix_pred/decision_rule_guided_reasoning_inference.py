@@ -36,12 +36,10 @@ class DecisionRuleGuidedMixin:
  	Shared decision-guidance and reasoning helpers for all decoders.
   	"""
 
-	def _init_decision_guidance(
-		self,
-		decision_labeler: DecisionLabeler,
-		guidance_config: Optional[DecisionGuidanceConfig] = None,
-		decision_places_bundle_path: Optional[str] = None,
-	) -> None:
+	def _init_decision_guidance(self,
+                             decision_labeler: DecisionLabeler,
+                             guidance_config: Optional[DecisionGuidanceConfig] = None,
+                             decision_places_bundle_path: Optional[str] = None) -> None:
 		self.decision_labeler = decision_labeler
 		self.guidance_config = guidance_config or DecisionGuidanceConfig()
 		self._reasoning_bundle_guards = self._load_reasoning_guards(decision_places_bundle_path)
@@ -95,11 +93,10 @@ class DecisionRuleGuidedMixin:
 
 		return attrs
 
-	def _decode_event_attrs_from_predicted_ids(
-		self,
-		predicted_cat_ids: Dict[str, int],
-		predicted_num_values: Optional[Dict[str, float]] = None,
-	) -> Dict[str, Any]:
+	def _decode_event_attrs_from_predicted_ids(self,
+                                            predicted_cat_ids: Dict[str, int],
+                                            predicted_num_values: Optional[Dict[str, float]] = None
+                                            ) -> Dict[str, Any]:
 		attrs: Dict[str, Any] = {}
 
 		for feature_name, token_id in predicted_cat_ids.items():
@@ -119,14 +116,14 @@ class DecisionRuleGuidedMixin:
 
 		return attrs
 
-	def _decode_event_attrs_from_suffix_step(
-		self,
-		suffix: Tuple[List[torch.Tensor], List[torch.Tensor]],
-		step_idx: int,
-		activity_id: int,
-		static_inputs: Any,
-	) -> Dict[str, Any]:
-		"""Build event attributes using predicted activity and GT non-activity attrs at step_idx."""
+	def _decode_event_attrs_from_suffix_step(self,
+                                          suffix: Tuple[List[torch.Tensor], List[torch.Tensor]],
+                                          step_idx: int,
+                                          activity_id: int,
+                                          static_inputs: Any,) -> Dict[str, Any]:
+		"""
+  		Build event attributes using predicted activity and GT non-activity attrs at step_idx.
+    	"""
 		suffix_cats, suffix_nums = suffix
 		cat_ids: Dict[str, int] = {}
 		num_vals: Dict[str, float] = {}
@@ -456,7 +453,8 @@ class GuidedMode(DecisionRuleGuidedMixin, Mode):
 
 		for step_idx in range(max_iteration + 1):
 			model_prefix = self._project_prefix_for_model(current_prefix)
-			probs = self.model(model_prefix).squeeze(0)
+			logits = self.model(model_prefix).squeeze(0)
+			probs = F.softmax(logits, dim=-1)
 
 			input_activity_id = int(current_prefix[0][self.concept_name_id][0, -1].item())
 			input_activity = self._activity_label(input_activity_id) if input_activity_id > 0 else ""

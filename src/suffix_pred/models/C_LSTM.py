@@ -129,26 +129,21 @@ class FullShared_Join_LSTM(nn.Module):
 
         # Final heads & activations
         a_logits = self.act_head(h_act) # (B, output_size_act)
-
-        # Transform logits into probabilities
-        a_probs = F.softmax(a_logits, dim=-1)
         
-        return a_probs    
+        return a_logits
     
     def save(self, path : str):
         """
         Store the trained model at path.
         """
         checkpoint = {'model_state_dict' : self.state_dict(),
-                      'kwargs' : {
-                        'data_set_categories' : self.data_set_categories,
-                        'hidden_size': self.hidden_size,
-                        'num_layers': self.num_layers,
-                        'model_feat': self.model_feat,
-                        'input_size': self.input_size,
-                        'output_size_act': self.output_size_act
-                      }
-                    }
+                      'kwargs' : 
+                          {'data_set_categories' : self.data_set_categories,
+                           'hidden_size': self.hidden_size,
+                           'num_layers': self.num_layers,
+                           'model_feat': self.model_feat,
+                           'input_size': self.input_size,
+                           'output_size_act': self.output_size_act}}
         return torch.save(checkpoint, path)
 
     @staticmethod
