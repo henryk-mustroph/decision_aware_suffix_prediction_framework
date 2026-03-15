@@ -126,7 +126,7 @@ def evaluate_dls(outputs: list[dict],
 
     mode = str(outputs[0].get("mode", "")).strip().lower()
 
-    if mode == "probabilistic":
+    if "probabilistic" in mode:
         return _evaluate_probabilistic(
             outputs,
             reduction=probabilistic_reduction,

@@ -16,7 +16,9 @@ import torch.nn.functional as F
 from tqdm.notebook import tqdm
 
 # required files:
+# use the decision labeling same as for training but online.
 from data_processing.decision_labeling import DecisionLabeler
+# use the inference modes implemented also in the standard case
 from .inference import Mode, Beam, MCSA
 
 
@@ -60,6 +62,7 @@ class DecisionRuleGuidedMixin:
 		self.last_reasoning_trace: List[Dict[str, Any]] = []
 		self.last_conflicts: int = 0
 		self.last_decision_steps: int = 0
+		self.last_explained_steps: int = 0
 
 	@staticmethod
 	def _load_reasoning_guards(decision_places_bundle_path: Optional[str]) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
@@ -153,9 +156,10 @@ class DecisionRuleGuidedMixin:
 		prefix: Tuple[List[torch.Tensor], List[torch.Tensor]],
 		suffix: Tuple[List[torch.Tensor], List[torch.Tensor]],
 		step_idx: int,
-		activity_id: int,
-	) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-		"""Roll prefix and append predicted activity with GT non-activity attributes at step_idx."""
+		activity_id: int) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+		"""
+  		Roll prefix and append predicted activity with GT non-activity attributes at step_idx.
+    	"""
 		prefix_cats, prefix_nums = prefix
 		suffix_cats, suffix_nums = suffix
 
@@ -363,6 +367,70 @@ class DecisionRuleGuidedMixin:
 		)
 		return matches[0]
 
+	def _build_attribute_checks(
+		self,
+		feature_row: Dict[str, Any],
+		guard: Dict[str, Any],
+	) -> List[Dict[str, Any]]:
+		"""Build per-attribute membership checks used in local reasoning output."""
+		checks: List[Dict[str, Any]] = []
+
+		intervals = guard.get("intervals", {}) or {}
+		allowed = guard.get("categorical_allowed", {}) or {}
+		excluded = guard.get("categorical_excluded", {}) or {}
+
+		for feat, bounds in intervals.items():
+			val = self._coerce_float_or_none(feature_row.get(feat, None))
+			low = self._coerce_float_or_none(bounds.get("low", None))
+			high = self._coerce_float_or_none(bounds.get("high", None))
+
+			in_rule_set = val is not None
+			if in_rule_set and low is not None:
+				in_rule_set = bool(val > low)
+			if in_rule_set and high is not None:
+				in_rule_set = bool(val <= high)
+
+			checks.append(
+				{
+					"attr": str(feat),
+					"value": None if val is None else float(val),
+					"in_rule_set": bool(in_rule_set),
+					"rule_type": "interval",
+					"low": None if low is None else float(low),
+					"high": None if high is None else float(high),
+				}
+			)
+
+		for feat, values in allowed.items():
+			val = feature_row.get(feat, None)
+			allowed_set = {str(v) for v in values}
+			in_rule_set = val is not None and str(val) in allowed_set
+			checks.append(
+				{
+					"attr": str(feat),
+					"value": None if val is None else str(val),
+					"in_rule_set": bool(in_rule_set),
+					"rule_type": "categorical_allowed",
+					"allowed": sorted(list(allowed_set)),
+				}
+			)
+
+		for feat, values in excluded.items():
+			val = feature_row.get(feat, None)
+			excluded_set = {str(v) for v in values}
+			in_rule_set = val is None or str(val) not in excluded_set
+			checks.append(
+				{
+					"attr": str(feat),
+					"value": None if val is None else str(val),
+					"in_rule_set": bool(in_rule_set),
+					"rule_type": "categorical_excluded",
+					"excluded": sorted(list(excluded_set)),
+				}
+			)
+
+		return checks
+
 	def _append_reasoning_step(
 		self,
 		step_idx: int,
@@ -370,17 +438,34 @@ class DecisionRuleGuidedMixin:
 		selected_activity: str,
 		decision_context: Optional[Tuple[str, Dict[str, float], float]],
 		past_events: List[Dict[str, Any]],
+		model_prob: Optional[float] = None,
 	) -> None:
 		if decision_context is None:
 			return
 
 		place_name, z_i, c_i = decision_context
 		conflict, supported = self._is_conflict(selected_activity, z_i)
-		matched_guard = self._best_matching_guard(place_name, selected_activity, past_events)
+		sorted_decisions = sorted(z_i.items(), key=lambda kv: float(kv[1]), reverse=True)
+		top_decision_event = str(sorted_decisions[0][0]) if len(sorted_decisions) > 0 else None
+		top_decision_prob = float(sorted_decisions[0][1]) if len(sorted_decisions) > 0 else None
 
 		self.last_decision_steps += 1
 		if conflict:
 			self.last_conflicts += 1
+
+		matched_guard = None
+		attribute_checks: List[Dict[str, Any]] = []
+		explanation_status = "conflict_not_supported" if conflict else "no_matching_rule"
+		explained = False
+
+		if not conflict:
+			matched_guard = self._best_matching_guard(place_name, selected_activity, past_events)
+			if matched_guard is not None:
+				feature_row = self.decision_labeler._build_feature_row(past_events)
+				attribute_checks = self._build_attribute_checks(feature_row, matched_guard)
+				self.last_explained_steps += 1
+				explanation_status = "explained"
+				explained = True
 
 		self.last_reasoning_trace.append(
 			{
@@ -388,10 +473,16 @@ class DecisionRuleGuidedMixin:
 				"place": place_name,
 				"input_event": str(input_activity),
 				"next_event": str(selected_activity),
+				"model_prob": float(model_prob) if model_prob is not None else None,
 				"confidence": float(c_i),
-				"supported_set": supported,
+				"decision_top_event": top_decision_event,
+				"decision_top_prob": top_decision_prob,
+				"supported_set": [str(a) for a in supported],
 				"conflict": bool(conflict),
+				"explained": bool(explained),
+				"explanation_status": str(explanation_status),
 				"decision_distribution": {k: float(v) for k, v in z_i.items()},
+				"attribute_checks": attribute_checks,
 				"matched_rule": None if matched_guard is None else {
 					"rule": matched_guard.get("rule", ""),
 					"raw_rule": matched_guard.get("raw_rule", ""),
@@ -406,10 +497,15 @@ class DecisionRuleGuidedMixin:
 		rate = 0.0
 		if self.last_decision_steps > 0:
 			rate = float(self.last_conflicts) / float(self.last_decision_steps)
+		explained_rate = 0.0
+		if self.last_decision_steps > 0:
+			explained_rate = float(self.last_explained_steps) / float(self.last_decision_steps)
 		return {
 			"decision_steps": int(self.last_decision_steps),
 			"conflicts": int(self.last_conflicts),
 			"conflict_rate": float(rate),
+			"explained_steps": int(self.last_explained_steps),
+			"explained_rate": float(explained_rate),
 			"trace": list(self.last_reasoning_trace),
 		}
 
@@ -417,6 +513,7 @@ class DecisionRuleGuidedMixin:
 		self.last_reasoning_trace = []
 		self.last_conflicts = 0
 		self.last_decision_steps = 0
+		self.last_explained_steps = 0
 
 
 class GuidedMode(DecisionRuleGuidedMixin, Mode):
@@ -479,6 +576,7 @@ class GuidedMode(DecisionRuleGuidedMixin, Mode):
 				selected_activity=selected_activity,
 				decision_context=decision_context,
 				past_events=past_events,
+				model_prob=float(masked_probs[activity_id].item()),
 			)
 
 			current_prefix = self._roll_prefix_with_activity(
@@ -627,6 +725,7 @@ class GuidedMCSA(DecisionRuleGuidedMixin, MCSA):
 				selected_activity=selected_activity,
 				decision_context=decision_context,
 				past_events=past_events,
+				model_prob=float(masked_probs[sampled_activity_id].item()),
 			)
 
 			cat_predictions = self._sample_categorical_predictions(cat_means, cat_vars)
@@ -848,10 +947,25 @@ class GuidedBeam(DecisionRuleGuidedMixin, Beam):
 						if decision_context is not None:
 							place_name, z_i, c_i = decision_context
 							conflict, supported = self._is_conflict(selected_activity, z_i)
-							guard = self._best_matching_guard(place_name, selected_activity, new_past_events)
+							sorted_decisions = sorted(z_i.items(), key=lambda kv: float(kv[1]), reverse=True)
+							top_decision_event = str(sorted_decisions[0][0]) if len(sorted_decisions) > 0 else None
+							top_decision_prob = float(sorted_decisions[0][1]) if len(sorted_decisions) > 0 else None
 							new_decision_steps += 1
 							if conflict:
 								new_conflicts += 1
+
+							guard = None
+							attribute_checks: List[Dict[str, Any]] = []
+							explanation_status = "conflict_not_supported" if conflict else "no_matching_rule"
+							explained = False
+							if not conflict:
+								guard = self._best_matching_guard(place_name, selected_activity, new_past_events)
+								if guard is not None:
+									feature_row = self.decision_labeler._build_feature_row(new_past_events)
+									attribute_checks = self._build_attribute_checks(feature_row, guard)
+									explained = True
+									explanation_status = "explained"
+
 							new_reasoning.append(
 								{
 									"step": int(step_idx),
@@ -859,9 +973,14 @@ class GuidedBeam(DecisionRuleGuidedMixin, Beam):
 									"input_event": str(input_activity),
 									"next_event": str(selected_activity),
 									"confidence": float(c_i),
-									"supported_set": supported,
+									"decision_top_event": top_decision_event,
+									"decision_top_prob": top_decision_prob,
+									"supported_set": [str(a) for a in supported],
 									"conflict": bool(conflict),
+									"explained": bool(explained),
+									"explanation_status": str(explanation_status),
 									"decision_distribution": {k: float(v) for k, v in z_i.items()},
+									"attribute_checks": attribute_checks,
 									"matched_rule": None if guard is None else {
 										"rule": guard.get("rule", ""),
 										"raw_rule": guard.get("raw_rule", ""),
@@ -915,11 +1034,17 @@ class GuidedBeam(DecisionRuleGuidedMixin, Beam):
 			rate = 0.0
 			if b["decision_steps"] > 0:
 				rate = float(b["conflicts"]) / float(b["decision_steps"])
+			explained_steps = sum(1 for r in b["reasoning"] if bool(r.get("explained", False)))
+			explained_rate = 0.0
+			if b["decision_steps"] > 0:
+				explained_rate = float(explained_steps) / float(b["decision_steps"])
 			reasoning_beams.append(
 				{
 					"decision_steps": int(b["decision_steps"]),
 					"conflicts": int(b["conflicts"]),
 					"conflict_rate": float(rate),
+					"explained_steps": int(explained_steps),
+					"explained_rate": float(explained_rate),
 					"trace": b["reasoning"],
 					"beam_logprob": float(b["score"]),
 				}

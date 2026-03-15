@@ -51,6 +51,21 @@ class Trainer:
         self.shuffle = optimize_values.get("shuffle", True)
         self.guard_support_threshold = optimize_values.get("guard_support_threshold", 0.0)
 
+        # Teacher forcing policy shared by autoregressive trainers.
+        self.teacher_forcing_mode = str(
+            optimize_values.get("teacher_forcing_mode", "scheduled")
+        ).lower()
+        if self.teacher_forcing_mode not in {"scheduled", "fixed"}:
+            raise ValueError(
+                "teacher_forcing_mode must be either 'scheduled' or 'fixed'"
+            )
+        self.fixed_teacher_forcing_ratio = float(
+            optimize_values.get("fixed_teacher_forcing_ratio", 1.0)
+        )
+        self.fixed_teacher_forcing_ratio = max(
+            0.0, min(1.0, self.fixed_teacher_forcing_ratio)
+        )
+
         self.save_model_n_th_epoch = save_model_n_th_epoch
         self.saving_path = saving_path
 
@@ -175,6 +190,29 @@ class Trainer:
         epsilon = 1.0 - teacher_forcing_ratio
         return epsilon, teacher_forcing_ratio
 
+    def _teacher_forcing_rates(self,
+                               step_index,
+                               *,
+                               epsilon_max,
+                               inverse_sigmoid_k,
+                               min_teacher_forcing=0.0):
+        """
+        Resolve teacher forcing for this epoch according to configured mode.
+
+        Modes:
+        - scheduled: inverse-sigmoid schedule (existing behavior)
+        - fixed: constant teacher forcing ratio across all epochs
+        """
+        if self.teacher_forcing_mode == "fixed":
+            teacher_forcing_ratio = self.fixed_teacher_forcing_ratio
+            epsilon = 1.0 - teacher_forcing_ratio
+            return epsilon, teacher_forcing_ratio
+
+        return self._scheduled_sampling_rates(step_index=step_index,
+                                              epsilon_max=epsilon_max,
+                                              inverse_sigmoid_k=inverse_sigmoid_k,
+                                              min_teacher_forcing=min_teacher_forcing)
+
     def _extract_guard_suffix(self, z_targets, z_mask, suffix_size, c_values=None):
         """
         Per-event decision labels that are stored for the whole window and cut out exactly the subset that lines up with decoder steps during autoregressive suffix training
@@ -251,6 +289,15 @@ class UEDTrainer(Trainer):
         self.max_teacher_forcing_value = optimize_values["max_teacher_forcing_value"]
         self.scheduled_sampling_epsilon_max = optimize_values.get("scheduled_sampling_epsilon_max", self.max_teacher_forcing_value)
         self.scheduled_sampling_k = optimize_values.get("scheduled_sampling_k", max(1.0, self.epochs / 10.0))
+
+        print("Teacher forcing mode:", self.teacher_forcing_mode)
+        if self.teacher_forcing_mode == "fixed":
+            print("Fixed teacher forcing ratio:", self.fixed_teacher_forcing_ratio)
+        else:
+            print(
+                "Scheduled sampling ε:",
+                f"0.0 -> {self.scheduled_sampling_epsilon_max} (inverse-sigmoid)",
+            )
         
         # Events in sufffix: Dependent on data set
         self.suffix_data_split_value = suffix_data_split_value
@@ -314,11 +361,13 @@ class UEDTrainer(Trainer):
             epoch_loss = 0.0
             num_batches_per_epoch = 0.0
             
-            # Inverse-sigmoid scheduled sampling: increase replacement epsilon over time.
-            self.scheduled_sampling_epsilon, self.teacher_forcing_ratio = self._scheduled_sampling_rates(step_index=epoch,
-                                                                                                         epsilon_max=self.scheduled_sampling_epsilon_max,
-                                                                                                         inverse_sigmoid_k=self.scheduled_sampling_k,
-                                                                                                         min_teacher_forcing=self.min_teacher_forcing_value)
+            # Select teacher forcing policy (fixed ratio or scheduled sampling).
+            self.scheduled_sampling_epsilon, self.teacher_forcing_ratio = self._teacher_forcing_rates(
+                step_index=epoch,
+                epsilon_max=self.scheduled_sampling_epsilon_max,
+                inverse_sigmoid_k=self.scheduled_sampling_k,
+                min_teacher_forcing=self.min_teacher_forcing_value,
+            )
             
             # Bacth Loop
             for _, train_data in enumerate(train_dataloader): 
@@ -956,7 +1005,11 @@ class TTraining(Trainer):
         print("Mode: ", "GAN (Algorithm 1: MLMME)" if self.use_gan else "MLE-only")
         print("Epochs (iterations): ", self.epochs)
         print("Gumbel-softmax τ: ", f"{self.tau_start} → {self.tau_min} (exponential anneal)")
-        print("Scheduled sampling ε:", f"0.0 → {self.scheduled_sampling_epsilon_max} (inverse-sigmoid)")
+        print("Teacher forcing mode:", self.teacher_forcing_mode)
+        if self.teacher_forcing_mode == "fixed":
+            print("Fixed teacher forcing ratio:", self.fixed_teacher_forcing_ratio)
+        else:
+            print("Scheduled sampling ε:", f"0.0 -> {self.scheduled_sampling_epsilon_max} (inverse-sigmoid)")
 
     def _init_prefix_feature_indices(self):
         """
@@ -1070,11 +1123,13 @@ class TTraining(Trainer):
             # Exponential Gumbel-softmax temperature annealing (τ: 0.9 → ~0)
             tau = max(self.tau_min, self.tau_start * math.exp(-anneal_rate * epoch))
 
-            # Inverse-sigmoid scheduled sampling: increase replacement epsilon over time.
-            self.scheduled_sampling_epsilon, self.teacher_forcing_ratio = self._scheduled_sampling_rates(step_index=epoch,
-                                                                                                         epsilon_max=self.scheduled_sampling_epsilon_max,
-                                                                                                         inverse_sigmoid_k=self.scheduled_sampling_k,
-                                                                                                         min_teacher_forcing=self.min_teacher_forcing_value)
+            # Select teacher forcing policy (fixed ratio or scheduled sampling).
+            self.scheduled_sampling_epsilon, self.teacher_forcing_ratio = self._teacher_forcing_rates(
+                step_index=epoch,
+                epsilon_max=self.scheduled_sampling_epsilon_max,
+                inverse_sigmoid_k=self.scheduled_sampling_k,
+                min_teacher_forcing=self.min_teacher_forcing_value,
+            )
             gen_loss_total = 0.0
             disc_loss_total = 0.0
             n_batches = 0

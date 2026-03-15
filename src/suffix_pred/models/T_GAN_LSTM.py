@@ -80,15 +80,23 @@ class Seq2Seq(nn.Module):
         tf_mask = torch.zeros(trg.size(0), trg.size(1), device=src.device)
 
         for i in range(trg.size(1)):
+            # Keep semantics aligned with UED:
+            # tf_mask[:, i] == 1 iff decoder step i consumed a ground-truth input token.
+            # Step 0 always consumes the last prefix event (start_input), i.e. ground truth.
+            if i == 0:
+                tf_mask[:, i] = 1.0
+            else:
+                teacher_force = random.random() < teacher_forcing_ratio
+                if teacher_force:
+                    tf_mask[:, i] = 1.0
+                    # For decoder step i, consume previous true suffix event y_{i-1}.
+                    inp = trg[:, i - 1 : i, :]
+                else:
+                    # For decoder step i, consume previous model prediction y_hat_{i-1}.
+                    inp = output
+
             output, hidden, cell = self.decoder(inp, hidden, cell)
             predictions.append(output)
-
-            teacher_force = random.random() < teacher_forcing_ratio
-            if teacher_force:
-                tf_mask[:, i] = 1.0
-                inp = trg[:, i, :].view((trg.size(0), 1, trg.size(2)))
-            else:
-                inp = output
 
         prediction = torch.cat(predictions, dim=1)
         if return_teacher_forcing_mask:

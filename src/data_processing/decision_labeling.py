@@ -61,8 +61,8 @@ class DecisionLabeler:
     Args:
     - petri_net : tuple: (net, initial_marking, final_marking) from pm4py.
     - decision_model_dir : str: Path to directory containing per-place .pkl estimator files.
-    - decision_places_bundle_path : str: Path to the decision_places_bundle.json produced by ``DecisionDiscovery.save_results``.
-    - dynamic_attributes, static_attributes : list[str] | None: (The same attribute lists given to ``DecisionDiscovery``)! during model training.
+    - decision_places_bundle_path : str: Path to the decision_places_bundle.json produced by DecisionDiscovery.save_results.
+    - dynamic_attributes, static_attributes : list[str] | None: (The same attribute lists given to DecisionDiscovery)! during model training.
     """
     def __init__(self,
                  petri_net: Tuple,
@@ -258,8 +258,7 @@ class DecisionLabeler:
         Outputs:
         dict  {case_id: list-of-event-labels}
         - Each event label is:
-            - (p_i, A_i, z_i, c_i) for a decision event, or
-            - (BOTTOM, A_i, {}, 0.0) for a non-decision event.
+        either (p_i, A_i, z_i, c_i) for a decision event, or (BOTTOM, A_i, {}, 0.0) for a non-decision event.
         """
         # Pre-compute elapsed times the same way DecisionDiscovery does.
         df = event_log_df.copy()
@@ -282,8 +281,9 @@ class DecisionLabeler:
             event_records: List[Dict[str, Any]] = []
 
             for (log_name, model_name), (log_label, model_label) in case_alignment:
+                # log-only move
                 if model_name == ">>":
-                    continue  # log-only move
+                    continue  
 
                 trans = self.transition_by_name.get(model_name)
                 if trans is None:
@@ -307,9 +307,7 @@ class DecisionLabeler:
                     else:
                         event_attrs = None
 
-                    # Update data state first: decision-aware labeling for a
-                    # place in t• predicts the next event after e_i, so the
-                    # feature state A_i includes e_i and all prior events.
+                    # Update data state first: decision-aware labeling for a place in t• predicts the next event after e_i, so the feature state A_i includes e_i and all prior events.
                     if event_attrs is not None:
                         past_events.append(event_attrs)
 

@@ -754,6 +754,15 @@ class FunctionEstimator:
             # Keep CatBoost categorical handling consistent between fit/predict
             if mt == "catboost" and self._cb_cat_cols:
                 X_cb = self._cast_cat_columns_for_catboost(X_raw, self._cb_cat_cols)
+                # Coerce any non-categorical column that contains a string
+                # value to NaN.  This can happen when prediction-time feature
+                # rows contain an extra event compared to training (off-by-one
+                # between _collect_I and label_traces_offline), causing a lag
+                # column that was all-NaN/float during training to carry a
+                # string at prediction time.
+                num_cols = [c for c in X_cb.columns if c not in self._cb_cat_cols]
+                for c in num_cols:
+                    X_cb[c] = pd.to_numeric(X_cb[c], errors="coerce")
                 proba = self.base_model_cal.predict_proba(X_cb)[0]
             else:
                 proba = self.base_model_cal.predict_proba(X_raw)[0]

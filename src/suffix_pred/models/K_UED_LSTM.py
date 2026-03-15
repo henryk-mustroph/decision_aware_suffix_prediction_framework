@@ -403,6 +403,8 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
             for t in range(self.seq_len_pred):
                 # SOS Event
                 if t == 0:
+                    # Step 0 always consumes the last prefix event (ground truth).
+                    tf_mask[:, t] = 1.0
                     # preds: list containing two dicts one for all means (cat, num),
                     # one for all vars (cat, num)
                     preds, (h, c), z = self.decoder(input=sos_event, hx=(h_enc, c_enc), z=None, pred=False)

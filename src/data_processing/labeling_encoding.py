@@ -1285,18 +1285,24 @@ class EventLogDataset(Dataset):
     def _initialize_decision_data(self) -> torch.Tensor:
         return torch.empty((self.zero_padding.shape[0], 0), dtype=torch.float32)
 
+
+    #
+    #
+    # New: transform (p,A,z,c) to tensors required for training
+    #
+    #
     def prepare_guard_tensors(self, concept_name_feature_idx: int) -> None:
         """
         Convert sparse decision_data to dense guard tensors for training.
-
-        Must be called after set_decision_data.  Creates:
-          _guard_targets    [N, T, num_classes]  soft z_i distributions
-          _guard_mask       [N, T]               1 at decision-labeled positions
-          _guard_confidence [N, T]               c_i = max(z_i) at decision positions
+        Must be called after set_decision_data.  
+        
+        Creates:
+        _guard_targets: [N, T, num_classes]: soft z_i distributions: for each trace, a list with size (padded) as the inputs, for each value a list with probs for next event label of vocabulary A
+        _guard_mask: [N, T]: 1 at decision-labeled positions: for each trace, a list with size (padded) as the inputs, with one is the event is decision event
+        _guard_confidence [N, T]: c_i = max(z_i) at decision positions: for each trace, a list with size (padded) as the inputs, the prob of arg-max over next event label classes.
 
         Args:
-            concept_name_feature_idx:  index of the concept:name feature
-                inside ``all_categories[0]``.
+        - concept_name_feature_idx: index of the concept:name feature inside all_categories[0].
         """
         if isinstance(self.decision_data, torch.Tensor):
             return  # decision data not set yet
@@ -1335,57 +1341,6 @@ class EventLogDataset(Dataset):
         self._guard_targets = guard_targets
         self._guard_mask = guard_mask
         self._guard_confidence = guard_confidence
-
-    def apply_coverage_gate(
-        self,
-        coverage_by_place: Dict[str, float],
-        coverage_threshold: float,
-    ) -> None:
-        """Zero out guard_mask positions for low-coverage decision places.
-
-        A decision place p is considered low-coverage when
-        ``coverage_by_place[p] < coverage_threshold``, i.e. the decision
-        model cannot predict the true next activity in most cases because
-        the true label lies outside the model's support.  Skipping such
-        places prevents spurious regularization from a poorly-calibrated
-        distribution.
-
-        Must be called after :meth:`prepare_guard_tensors`.
-
-        Parameters
-        ----------
-        coverage_by_place:
-            ``{place_name: coverage_value}`` dict, e.g. from
-            :func:`decision_labeling.compute_dp_diagnostics`.
-        coverage_threshold:
-            Places with ``coverage < coverage_threshold`` have their guard
-            positions zeroed.  A sensible starting value is ``0.5``.
-        """
-        if self._guard_mask is None:
-            raise RuntimeError("prepare_guard_tensors must be called first.")
-        if not isinstance(self.decision_data, list):
-            return
-
-        low_coverage_places = {
-            p for p, cov in coverage_by_place.items()
-            if cov < coverage_threshold
-        }
-        if not low_coverage_places:
-            return
-
-        N = len(self)
-        T = self._guard_mask.shape[1]
-
-        for i in range(N):
-            dd = self.decision_data[i]
-            if not isinstance(dd, list) or len(dd) == 0:
-                continue
-            P = len(dd)
-            offset = T - P
-            for j, entry in enumerate(dd):
-                place_name = entry[0]
-                if place_name in low_coverage_places:
-                    self._guard_mask[i, offset + j] = 0.0
 
     def __len__(self):
         """
@@ -1618,8 +1573,11 @@ class EventLogLoader:
         encoded_data, all_categories, all_static_categories = self.encoder_decoder.encode_df(df)
         return EventLogDataset(encoded_data, all_categories, all_static_categories, self.encoder_decoder)
 
+    
+    #
     #
     # New: label dataset for decision-aware training:
+    #
     #
     def label_dataset(self,
                       dataset: EventLogDataset,
