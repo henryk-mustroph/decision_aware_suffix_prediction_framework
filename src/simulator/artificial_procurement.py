@@ -192,12 +192,10 @@ class ProcurementSimulator:
                 "time:timestamp":       t,
                 "org:resource":         resource,
                 # dynamic
-                "requester":            case["requester"],
                 "requester_seniority":  case["requester_seniority"],
                 "amount":               case["amount"],
                 "budget_status":        case["budget_status"],
                 "revision_count":       case["revision_count"],
-                "supplier":             case["supplier"],
                 "supplier_type":        case["supplier_type"],
                 "goods_match":          case["goods_match"],
                 "invoice_deviation_pct": case["invoice_deviation_pct"],
@@ -455,7 +453,6 @@ class ProcurementSimulator:
             "concept:name",
             "time:timestamp",
             "org:resource",
-            "requester",
             "requester_seniority",
             "department",
             "category",
@@ -463,7 +460,6 @@ class ProcurementSimulator:
             "amount",
             "budget_status",
             "revision_count",
-            "supplier",
             "supplier_type",
             "goods_match",
             "invoice_deviation_pct",
@@ -482,9 +478,7 @@ class ProcurementSimulator:
             writer.writerows(rows)
 
     def _format_datetime(self, dt: datetime) -> str:
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.isoformat(timespec="milliseconds")
+        return dt.strftime('%Y-%m-%d %H:%M:%S.%f')
 
 
 # ============================================================
@@ -501,7 +495,7 @@ if __name__ == "__main__":
     traces = simulator.run_and_save(
         n_cases=10_000,
         csv_path="procurement_event_log.csv",
-        start_time=datetime(2025, 1, 1, 8, 0, 0, tzinfo=timezone.utc),
+        start_time=datetime(2025, 1, 1, 8, 0, 0),
     )
 
     total_events = sum(len(tr) for tr in traces)
