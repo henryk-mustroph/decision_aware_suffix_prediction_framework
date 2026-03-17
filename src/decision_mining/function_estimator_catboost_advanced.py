@@ -84,7 +84,7 @@ class ModelConfig:
     surrogate_tune_ccp_alpha: bool = True
     surrogate_pruning_cv: int = 3
     surrogate_pruning_max_alphas: int = 12
-    surrogate_pruning_metric: str = "auto"  # "auto" | "prauc" (binary) | "f1_macro" (multiclass)
+    surrogate_pruning_metric: str = "auto"
 
     # Probability calibration (base model). Disabled by default because
     # CatBoost is usually calibrated enough for this use case, and CV

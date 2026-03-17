@@ -1,11 +1,12 @@
 """
-Compact, alignment-driven decision mining. 
-Based on algorithm from:
+Compact, alignment-driven decision mining adopted for suffix prediction from: 
 - De Leoni, and Van Der Aalst. "Data-aware process mining: discovering decisions in processes using alignments." ACM symposium on applied computing. 2013.
 
 Adaptions:
 - train the models to predict the next visible event, not a transition in the process model 
-- Use only and also historical events as input for decision mining
+(correctly finds the event label of the first synchronous move at k ≥ i (both log and model sides are non->>)
+- Use only and also historical events as input for decision mining 
+(before the current step's event attributes are appended. Only synchronous moves (log_name != ">>") contribute to history. The current event at position i is never included in its own features)
 """
 from __future__ import annotations
 
@@ -53,7 +54,7 @@ class DecisionDiscovery:
         # map transition name -> transition object
         self.transition_by_key: Dict[str, Any] = {str(t.name): t for t in self.net.transitions}
 
-        # decision places (>1 outgoing)
+        # decision points (>1 outgoing)
         self.decision_places: List[Any] = [p for p in self.net.places if len(p.out_arcs) > 1]
         
         # dict: key: decision place, value: list of outgoing transitions from this place
@@ -116,7 +117,7 @@ class DecisionDiscovery:
         """
         collect training data per decision place
         """
-        # list of alignments: [[(('>>', 'skip_2'), ('>>', None)), (('>>', 'init_loop_3'), ('>>', None)), ... ], ...]
+        # example list of alignments: [[(('>>', 'skip_2'), ('>>', None)), (('>>', 'init_loop_3'), ('>>', None)), ... ], ...]
         
         # store train data for each transition place
         I: Dict[Any, List[Tuple[Dict[str, Any], Any]]] = defaultdict(list)
@@ -131,10 +132,7 @@ class DecisionDiscovery:
             ].reset_index(drop=True)
             case_event_cursor = 0
 
-            # Pre-compute the first visible activity at or after each
-            # alignment step (walking backwards).  This is the *next
-            # visible activity* that results from the decision — the
-            # label the decision model should learn to predict.
+            # Pre-compute the first visible event label as target
             n_steps = len(case_alignment)
             first_visible_at_or_after = [None] * n_steps
             future_visible = None
