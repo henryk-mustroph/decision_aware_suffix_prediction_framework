@@ -1,8 +1,3 @@
-"""
-According to:
-Taymouri, Farbod, Marcello La Rosa, and Sarah M. Erfani,A deep adversarial model for suffix and remaining time prediction of event sequences, International Conference on Data Mining (SDM), 2021.
-"""
-
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"

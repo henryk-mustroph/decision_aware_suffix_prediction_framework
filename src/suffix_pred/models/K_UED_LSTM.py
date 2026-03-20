@@ -1,8 +1,3 @@
-"""
-According to:
-M. Kunkler, H. Mustroph and S. Rinderle-Ma, "Probabilistic Suffix Prediction of Business Processes, International Conference on Process Mining (ICPM) 2025, doi: 10.1109/ICPM66919.2025.11220650.
-"""
-
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
