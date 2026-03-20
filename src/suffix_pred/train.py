@@ -52,19 +52,16 @@ class Trainer:
         self.guard_support_threshold = optimize_values.get("guard_support_threshold", 0.0)
 
         # Teacher forcing policy shared by autoregressive trainers.
-        self.teacher_forcing_mode = str(
-            optimize_values.get("teacher_forcing_mode", "scheduled")
-        ).lower()
+        self.teacher_forcing_mode = str(optimize_values.get("teacher_forcing_mode", "scheduled")).lower()
+        
+        # fix not possible: makes no sense, to train only on target last events
+        
         if self.teacher_forcing_mode not in {"scheduled", "fixed"}:
-            raise ValueError(
-                "teacher_forcing_mode must be either 'scheduled' or 'fixed'"
-            )
-        self.fixed_teacher_forcing_ratio = float(
-            optimize_values.get("fixed_teacher_forcing_ratio", 1.0)
-        )
-        self.fixed_teacher_forcing_ratio = max(
-            0.0, min(1.0, self.fixed_teacher_forcing_ratio)
-        )
+            raise ValueError("teacher_forcing_mode must be either 'scheduled' or 'fixed'")
+        
+        self.fixed_teacher_forcing_ratio = float(optimize_values.get("fixed_teacher_forcing_ratio", 1.0))
+        
+        self.fixed_teacher_forcing_ratio = max(0.0, min(1.0, self.fixed_teacher_forcing_ratio))
 
         self.save_model_n_th_epoch = save_model_n_th_epoch
         self.saving_path = saving_path
@@ -294,10 +291,8 @@ class UEDTrainer(Trainer):
         if self.teacher_forcing_mode == "fixed":
             print("Fixed teacher forcing ratio:", self.fixed_teacher_forcing_ratio)
         else:
-            print(
-                "Scheduled sampling ε:",
-                f"0.0 -> {self.scheduled_sampling_epsilon_max} (inverse-sigmoid)",
-            )
+            print("Scheduled sampling ε:",
+                  f"0.0 -> {self.scheduled_sampling_epsilon_max} (inverse-sigmoid)",)
         
         # Events in sufffix: Dependent on data set
         self.suffix_data_split_value = suffix_data_split_value
@@ -916,24 +911,8 @@ class CTraining(Trainer):
 #
 class TTraining(Trainer):
     """
-    Trainer for Taymouri's GAN encoder-decoder LSTM (Algorithm 1: MLMME).
+    Trainer for Taymouri's GAN encoder-decoder LSTM.
     Implements adversarial training with Gumbel-softmax for differentiable categorical suffix generation:
-
-    Training procedure:
-    Initialize G and D parameters (standard normal distribution)
-    For each iteration (epoch):
-        For each (sigma≤k, sigma>k) ∈ S:
-            - Update θd by minimizing L(D;G) = -log(D(σ>k)) - log(1 - D(σ̂>k))
-            - Update θg by minimizing L(G;D) + L_supervised
-    Temperature τ of Gumbel-softmax anneals exponentially from 0.9 → ~0.
-
-    Recommended configuration (Taymouri et al.):
-    - RMSprop optimizer, lr=5e-5
-    - Gradient norm clipping to 1
-    - 100 iterations (epochs)
-    - Teacher forcing via inverse-sigmoid scheduled sampling
-
-    When use_gan=False in optimize_values, only L_supervised is used (MLE-only).
     """
 
     def __init__(self,

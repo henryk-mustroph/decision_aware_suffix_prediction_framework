@@ -221,14 +221,12 @@ def fit_feature_encoder(X_raw: pd.DataFrame, cfg: ModelConfig, prefix_sep: str =
         vc = s.value_counts(dropna=False)
         nunique = int(vc.shape[0])
 
-        info: Dict[str, Any] = {
-            "use_missing_token": use_missing,
-            "missing_token": MISSING_TOKEN,
-            "other_token": OTHER_TOKEN,
-            "rare_token": RARE_TOKEN,
-            "kept": set(),
-            "rare_values": None,
-        }
+        info: Dict[str, Any] = {"use_missing_token": use_missing,
+                                "missing_token": MISSING_TOKEN,
+                                "other_token": OTHER_TOKEN,
+                                "rare_token": RARE_TOKEN,
+                                "kept": set(),
+                                "rare_values": None,}
 
         if nunique <= int(cfg.low_card_max):
             min_freq = int(cfg.min_category_freq)
@@ -262,13 +260,11 @@ def fit_feature_encoder(X_raw: pd.DataFrame, cfg: ModelConfig, prefix_sep: str =
             if base in categorical_levels:
                 categorical_levels[base].append(level)
 
-    enc = FeatureEncoder(
-        raw_columns=raw_cols,
-        dummy_columns=list(X_enc.columns),
-        prefix_sep=prefix_sep,
-        cat_info=cat_info,
-        categorical_levels={k: sorted(set(v)) for k, v in categorical_levels.items()},
-    )
+    enc = FeatureEncoder(raw_columns=raw_cols,
+                         dummy_columns=list(X_enc.columns),
+                         prefix_sep=prefix_sep,
+                         cat_info=cat_info,
+                         categorical_levels={k: sorted(set(v)) for k, v in categorical_levels.items()},)
     return X_enc, enc
 
 
@@ -292,12 +288,11 @@ def select_ccp_alpha_cv(X: pd.DataFrame,
                         metric: str,
                         ) -> float:
 
-    base = DecisionTreeClassifier(
-        random_state=random_state,
-        max_depth=max_depth,
-        min_samples_leaf=min_samples_leaf,
-        ccp_alpha=0.0,
-    )
+    base = DecisionTreeClassifier(random_state=random_state,
+                                  max_depth=max_depth,
+                                  min_samples_leaf=min_samples_leaf,
+                                  ccp_alpha=0.0,)
+    
     path = base.cost_complexity_pruning_path(X, y, sample_weight=sample_weight)
     alphas = np.unique(path.ccp_alphas.astype(float))
     if alphas.size == 0:
@@ -419,7 +414,8 @@ class FunctionEstimator:
         return obj
 
     def _select_surrogate_features(self, X_raw: pd.DataFrame) -> pd.DataFrame:
-        """Reduce surrogate input space to the most informative raw features.
+        """
+        Reduce surrogate input space to the most informative raw features.
 
         This keeps guard trees smaller and faster while preserving the CatBoost
         base model as the predictive model.
@@ -476,7 +472,8 @@ class FunctionEstimator:
         return np.asarray(y_true, dtype=int)
 
     def _cast_cat_columns_for_catboost(self, X: pd.DataFrame, cat_cols: List[str]) -> pd.DataFrame:
-        """Cast CatBoost categorical columns to strings and fill missing token.
+        """
+        Cast CatBoost categorical columns to strings and fill missing token.
 
         CatBoost requires categorical columns to be provided (via cat_features) and values
         must be consistently typed; we use pandas string dtype and an explicit missing token.
@@ -495,7 +492,9 @@ class FunctionEstimator:
         return X_cb
 
     def _prepare_catboost_X(self, X: pd.DataFrame) -> Tuple[pd.DataFrame, List[int]]:
-        """Prepare data for CatBoost: detect categorical columns, cast to string, fill missing token."""
+        """
+        Prepare data for CatBoost: detect categorical columns, cast to string, fill missing token.
+        """
         cat_cols = _detect_categorical_columns(X, bool(self.cfg.treat_int_as_categorical))
         self._cb_cat_cols = cat_cols
         cat_idx = [X.columns.get_loc(c) for c in cat_cols]
@@ -555,13 +554,13 @@ class FunctionEstimator:
             min_class = int(nonzero.min()) if nonzero.size else 0
             cv = int(min(int(self.cfg.calibration_cv), n, min_class))
             if cv >= 2:
+                
                 # CalibratedClassifierCV will refit base model in CV folds. If that’s too slow,
                 # set cfg.calibrate=False (CatBoost is often well-calibrated already).
-                cal = CalibratedClassifierCV(
-                    self._make_fresh_base_model(n_classes=int(len(le.classes_))),  # fresh estimator for CV refit
-                    method=str(self.cfg.calibration_method),
-                    cv=cv,
-                )
+                cal = CalibratedClassifierCV(self._make_fresh_base_model(n_classes=int(len(le.classes_))),  # fresh estimator for CV refit
+                                             method=str(self.cfg.calibration_method),
+                                             cv=cv,
+                                            )
                 sw_full = compute_inverse_freq_weights(y_int_full) if bool(self.cfg.use_inverse_freq_weights) else None
 
                 # Important for CatBoost: pass cat_features during CV refits,
@@ -622,7 +621,9 @@ class FunctionEstimator:
         return self
 
     def _make_fresh_base_model(self, n_classes: Optional[int] = None) -> Any:
-        """A fresh estimator instance (used for calibration CV refits)."""
+        """
+        A fresh estimator instance (used for calibration CV refits).
+        """
         if str(self.cfg.model_type).lower() == "catboost":
             try:
                 from catboost import CatBoostClassifier
@@ -648,7 +649,9 @@ class FunctionEstimator:
         return DecisionTreeClassifier(random_state=self.cfg.random_state)
 
     def _fit_base_model(self, X: pd.DataFrame, y_int: np.ndarray, sample_weight: Optional[np.ndarray]) -> Any:
-        """Train the base model, with a safe prior fallback for degenerate feature sets."""
+        """
+        Train the base model, with a safe prior fallback for degenerate feature sets.
+        """
         mt = str(self.cfg.model_type).lower()
         n_classes = int(len(np.unique(y_int)))
         n_classes_total = int(len(self.class_int_to_label)) if self.class_int_to_label else n_classes
@@ -674,33 +677,27 @@ class FunctionEstimator:
                 pass
 
             loss = "Logloss" if n_classes == 2 else "MultiClass"
-            model = CatBoostClassifier(
-                iterations=int(self.cfg.cb_iterations),
-                learning_rate=float(self.cfg.cb_learning_rate),
-                depth=int(self.cfg.cb_depth),
-                l2_leaf_reg=float(self.cfg.cb_l2_leaf_reg),
-                loss_function=loss,
-                random_seed=int(self.cfg.random_state),
-                thread_count=int(self.cfg.cb_thread_count),
-                allow_writing_files=bool(self.cfg.cb_allow_writing_files),
-                verbose=False,
-            )
+            model = CatBoostClassifier(iterations=int(self.cfg.cb_iterations),
+                                       learning_rate=float(self.cfg.cb_learning_rate),
+                                       depth=int(self.cfg.cb_depth),
+                                       l2_leaf_reg=float(self.cfg.cb_l2_leaf_reg),
+                                       loss_function=loss,
+                                       random_seed=int(self.cfg.random_state),
+                                       thread_count=int(self.cfg.cb_thread_count),
+                                       allow_writing_files=bool(self.cfg.cb_allow_writing_files),
+                                       verbose=False,
+                                      )
             try:
-                fit_kwargs: Dict[str, Any] = {
-                    "cat_features": cat_idx,
-                    "sample_weight": sample_weight,
-                }
+                fit_kwargs: Dict[str, Any] = {"cat_features": cat_idx,
+                                              "sample_weight": sample_weight,}
 
                 eval_fraction = float(self.cfg.cb_eval_fraction)
                 early_rounds = int(self.cfg.cb_early_stopping_rounds)
                 class_counts = np.bincount(y_int)
                 nonzero = class_counts[class_counts > 0]
                 min_class = int(nonzero.min()) if nonzero.size else 0
-                can_split = (
-                    eval_fraction > 0.0
-                    and len(y_int) >= 50
-                    and min_class >= 2
-                )
+                
+                can_split = (eval_fraction > 0.0 and len(y_int) >= 50 and min_class >= 2)
 
                 if can_split:
                     idx = np.arange(len(y_int))
@@ -728,12 +725,12 @@ class FunctionEstimator:
                 raise
 
         # fallback: plain tree (less accurate on high-card cats, but runs everywhere)
-        clf = DecisionTreeClassifier(
-            random_state=self.cfg.random_state,
-            max_depth=self.cfg.surrogate_max_depth,
-            min_samples_leaf=self.cfg.surrogate_min_samples_leaf,
-        )
+        clf = DecisionTreeClassifier(random_state=self.cfg.random_state,
+                                     max_depth=self.cfg.surrogate_max_depth,
+                                     min_samples_leaf=self.cfg.surrogate_min_samples_leaf,)
+        
         clf.fit(X, y_int, sample_weight=sample_weight)
+        
         return clf
 
     def predict_proba(self, assignment: Dict[str, Any]) -> Tuple[List[str], np.ndarray]:
@@ -777,11 +774,11 @@ class FunctionEstimator:
           - model_proba: mean calibrated base probability within the leaf (+ normal CI)
           - emp_proba: empirical label frequency in the leaf (+ Wilson CI)
 
-        Output per label contains:
-          rule, intervals, categorical_allowed, categorical_excluded,
-          prob_model, prob_model_ci_low/high,
-          prob_emp, prob_emp_ci_low/high,
-          support, coverage, lift, score
+        Output:
+        - rule, intervals, categorical_allowed, categorical_excluded,
+        - prob_model, prob_model_ci_low/high,
+        - prob_emp, prob_emp_ci_low/high,
+        - support, coverage, lift, score
         """
         if self.surrogate_tree is None or self.encoder is None or self._train_X_enc is None or self._train_y_int is None or self._train_base_proba is None:
             raise RuntimeError("Estimator is not fitted or missing training caches.")
@@ -822,31 +819,27 @@ class FunctionEstimator:
                 pe = float(counts[j] / max(1.0, n))
                 lo_e, hi_e = _wilson_interval(float(counts[j]), n, ci=ci)
 
-                per_class.append(
-                    {
-                        "prob_model": pm,
-                        "prob_model_ci_low": float(lo_m),
-                        "prob_model_ci_high": float(hi_m),
-                        "prob_emp": pe,
-                        "prob_emp_ci_low": float(lo_e),
-                        "prob_emp_ci_high": float(hi_e),
-                    }
-                )
+                per_class.append({"prob_model": pm,
+                                  "prob_model_ci_low": float(lo_m),
+                                  "prob_model_ci_high": float(hi_m),
+                                  "prob_emp": pe,
+                                  "prob_emp_ci_low": float(lo_e),
+                                  "prob_emp_ci_high": float(hi_e),
+                                  })
 
             leaf_stats[int(leaf)] = {"support": support, "per_class": per_class}
 
         # traverse tree to produce rules per leaf node id
-        rules_by_label = _extract_rules_from_surrogate_with_stats(
-            tree=tree,
-            feature_names=self.feature_names,
-            class_int_to_label=self.class_int_to_label,
-            priors=self._priors,
-            leaf_stats=leaf_stats,
-            min_leaf_prob=float(self.cfg.min_leaf_prob),
-            min_leaf_lift=float(self.cfg.min_leaf_lift),
-            min_leaf_support=int(self.cfg.min_leaf_support),
-            always_keep_best=bool(self.cfg.always_keep_best),
-        )
+        rules_by_label = _extract_rules_from_surrogate_with_stats(tree=tree,
+                                                                  feature_names=self.feature_names,
+                                                                  class_int_to_label=self.class_int_to_label,
+                                                                  priors=self._priors,
+                                                                  leaf_stats=leaf_stats,
+                                                                  min_leaf_prob=float(self.cfg.min_leaf_prob),
+                                                                  min_leaf_lift=float(self.cfg.min_leaf_lift),
+                                                                  min_leaf_support=int(self.cfg.min_leaf_support),
+                                                                  always_keep_best=bool(self.cfg.always_keep_best),
+                                                                )
 
         # parse + simplify to (sets + intervals)
         cond_re = re.compile(r"\((.*?)\s*(<=|>)\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\)")
@@ -919,25 +912,23 @@ class FunctionEstimator:
                 pm = float(ro["prob_model"])
                 score = pm * math.log1p(support) * max(1.0, lift)
 
-                guards.append(
-                    {
-                        "rule": rule_str,
-                        "raw_rule": raw,
-                        "intervals": intervals,
-                        "categorical_allowed": cat_allowed,
-                        "categorical_excluded": cat_excluded,
-                        "prob_model": float(ro["prob_model"]),
-                        "prob_model_ci_low": float(ro["prob_model_ci_low"]),
-                        "prob_model_ci_high": float(ro["prob_model_ci_high"]),
-                        "prob_emp": float(ro["prob_emp"]),
-                        "prob_emp_ci_low": float(ro["prob_emp_ci_low"]),
-                        "prob_emp_ci_high": float(ro["prob_emp_ci_high"]),
-                        "support": support,
-                        "coverage": coverage,
-                        "lift": lift,
-                        "score": float(score),
-                    }
-                )
+                guards.append({"rule": rule_str,
+                               "raw_rule": raw,
+                               "intervals": intervals,
+                               "categorical_allowed": cat_allowed,
+                               "categorical_excluded": cat_excluded,
+                               "prob_model": float(ro["prob_model"]),
+                               "prob_model_ci_low": float(ro["prob_model_ci_low"]),
+                               "prob_model_ci_high": float(ro["prob_model_ci_high"]),
+                               "prob_emp": float(ro["prob_emp"]),
+                               "prob_emp_ci_low": float(ro["prob_emp_ci_low"]),
+                               "prob_emp_ci_high": float(ro["prob_emp_ci_high"]),
+                               "support": support,
+                               "coverage": coverage,
+                               "lift": lift,
+                               "score": float(score),
+                               }
+                            )
 
             # sort + cap
             key = str(self.cfg.rule_sort)
@@ -959,13 +950,11 @@ class FunctionEstimator:
         return out
 
 
-def _simplify_guard_rule(
-    intervals: Dict[str, Dict[str, Optional[float]]],
-    cat_allowed: Dict[str, List[str]],
-    cat_excluded: Dict[str, List[str]],
-    *,
-    max_set_show: int = 18,
-) -> str:
+def _simplify_guard_rule(intervals: Dict[str, Dict[str, Optional[float]]],
+                         cat_allowed: Dict[str, List[str]],
+                         cat_excluded: Dict[str, List[str]],
+                         *,
+                         max_set_show: int = 18) -> str:
     parts: List[str] = []
 
     for base in sorted(set(cat_allowed.keys()) | set(cat_excluded.keys())):
@@ -992,18 +981,16 @@ def _simplify_guard_rule(
     return " AND ".join(parts) if parts else "(true)"
 
 
-def _extract_rules_from_surrogate_with_stats(
-    *,
-    tree: DecisionTreeClassifier,
-    feature_names: List[str],
-    class_int_to_label: Dict[int, str],
-    priors: Dict[int, float],
-    leaf_stats: Dict[int, Dict[str, Any]],
-    min_leaf_prob: float,
-    min_leaf_lift: float,
-    min_leaf_support: int,
-    always_keep_best: bool,
-) -> Dict[str, List[Dict[str, Any]]]:
+def _extract_rules_from_surrogate_with_stats(*,
+                                             tree: DecisionTreeClassifier,
+                                             feature_names: List[str],
+                                             class_int_to_label: Dict[int, str],
+                                             priors: Dict[int, float],
+                                             leaf_stats: Dict[int, Dict[str, Any]],
+                                             min_leaf_prob: float,
+                                             min_leaf_lift: float,
+                                             min_leaf_support: int,
+                                             always_keep_best: bool,) -> Dict[str, List[Dict[str, Any]]]:
     """
     Traverse surrogate tree. At each leaf node id (= sklearn apply() id), attach probabilities from leaf_stats.
     Selection uses prob_model and lift (prob_model / prior).
@@ -1013,10 +1000,7 @@ def _extract_rules_from_surrogate_with_stats(
 
     # ensure output keys are true labels
     out: Dict[str, List[Dict[str, Any]]] = {class_int_to_label[i]: [] for i in range(len(class_int_to_label))}
-    best: Dict[str, Dict[str, Any]] = {
-        class_int_to_label[i]: {"prob_model": -1.0, "support": 0, "rule": "(false)", "lift": 0.0}
-        for i in range(len(class_int_to_label))
-    }
+    best: Dict[str, Dict[str, Any]] = {class_int_to_label[i]: {"prob_model": -1.0, "support": 0, "rule": "(false)", "lift": 0.0} for i in range(len(class_int_to_label))}
 
     def cond_str(feat_idx: int, thresh: float, direction: str) -> str:
         fname = feature_names[feat_idx]
@@ -1043,17 +1027,16 @@ def _extract_rules_from_surrogate_with_stats(
                 prior = float(priors.get(int(c_int), 1e-12))
                 lift = pm / max(prior, 1e-12)
 
-                obj = {
-                    "rule": rule_str,
-                    "support": support,
-                    "lift": float(lift),
-                    "prob_model": pm,
-                    "prob_model_ci_low": float(per_class[c_int]["prob_model_ci_low"]),
-                    "prob_model_ci_high": float(per_class[c_int]["prob_model_ci_high"]),
-                    "prob_emp": float(per_class[c_int]["prob_emp"]),
-                    "prob_emp_ci_low": float(per_class[c_int]["prob_emp_ci_low"]),
-                    "prob_emp_ci_high": float(per_class[c_int]["prob_emp_ci_high"]),
-                }
+                obj = {"rule": rule_str,
+                       "support": support,
+                       "lift": float(lift),
+                       "prob_model": pm,
+                       "prob_model_ci_low": float(per_class[c_int]["prob_model_ci_low"]),
+                       "prob_model_ci_high": float(per_class[c_int]["prob_model_ci_high"]),
+                       "prob_emp": float(per_class[c_int]["prob_emp"]),
+                       "prob_emp_ci_low": float(per_class[c_int]["prob_emp_ci_low"]),
+                       "prob_emp_ci_high": float(per_class[c_int]["prob_emp_ci_high"]),
+                       }
 
                 if pm > float(best[lab]["prob_model"]):
                     best[lab] = obj

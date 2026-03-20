@@ -14,8 +14,7 @@ def load_decoded_suffixes(cache_path: str) -> list[dict]:
     - Path to a .pkl file produced by :class: decode_test_set_suffixes.TestSetSuffixDecoder.
 
     Outputs:
-    - list[dict]
-        - Each dict contains: case_id, prefix_len, prefix, target_suffix, decoded_suffixes, mode.
+    - list[dict]: Each dict contains: case_id, prefix_len, prefix, target_suffix, decoded_suffixes, mode.
     """
     with open(cache_path, "rb") as handle:
         data = pickle.load(handle)
@@ -117,9 +116,7 @@ def evaluate_dls(outputs: list[dict],
     - Number of workers when parallel_scoring is enabled.
 
     Outputs:
-    pd.DataFrame
-        - Columns: case_id, prefix_len, dls, mode.
-                   (Probabilistic rows additionally include: dls_mean, dls_min, dls_best, dls_max.)
+    pd.DataFrame: Columns: case_id, prefix_len, dls, mode. Probabilistic rows additionally include: dls_mean, dls_min, dls_best, dls_max.)
     """
     if len(outputs) == 0:
         return pd.DataFrame(columns=["case_id", "prefix_len", "dls", "mode"])
@@ -127,22 +124,22 @@ def evaluate_dls(outputs: list[dict],
     mode = str(outputs[0].get("mode", "")).strip().lower()
 
     if "probabilistic" in mode:
-        return _evaluate_probabilistic(
-            outputs,
-            reduction=probabilistic_reduction,
-            parallel_scoring=parallel_scoring,
-            num_processes=num_processes,
-        )
+        return _evaluate_probabilistic(outputs,
+                                       reduction=probabilistic_reduction,
+                                       parallel_scoring=parallel_scoring,
+                                       num_processes=num_processes,
+                                      )
 
     rows = [_score_deterministic_row(row) for row in outputs]
     return pd.DataFrame(rows)
 
 def _evaluate_probabilistic(samples: list[dict],
-    reduction: ProbReduction = "mean",
-    parallel_scoring: bool = False,
-    num_processes: Optional[int] = None,
-) -> pd.DataFrame:
-    """Score probabilistic decoded outputs."""
+                            reduction: ProbReduction = "mean",
+                            parallel_scoring: bool = False,
+                            num_processes: Optional[int] = None,) -> pd.DataFrame:
+    """
+    Score probabilistic decoded outputs.
+    """
     if reduction not in ("mean", "best"):
         raise ValueError("Unsupported reduction. Use one of: 'mean', 'best'.")
 
@@ -152,10 +149,7 @@ def _evaluate_probabilistic(samples: list[dict],
 
     max_workers = max(1, int(num_processes or 1))
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(_score_probabilistic_row, row, reduction)
-            for row in samples
-        ]
+        futures = [executor.submit(_score_probabilistic_row, row, reduction)for row in samples]
         rows = [future.result() for future in concurrent.futures.as_completed(futures)]
 
     return pd.DataFrame(rows)
@@ -171,11 +165,10 @@ def dls_per_prefix_length(results_df: pd.DataFrame) -> pd.DataFrame:
 
     has_probabilistic_bounds = {"dls_min", "dls_max"}.issubset(results_df.columns)
     if has_probabilistic_bounds:
-        grouped = results_df.groupby("prefix_len", as_index=False).agg(
-            dls=("dls", "mean"),
-            dls_min=("dls_min", "mean"),
-            dls_max=("dls_max", "mean"),
-        )
+        grouped = results_df.groupby("prefix_len", as_index=False).agg(dls=("dls", "mean"),
+                                                                       dls_min=("dls_min", "mean"),
+                                                                       dls_max=("dls_max", "mean"),
+                                                                       )
     else:
         grouped = results_df.groupby("prefix_len", as_index=False)["dls"].mean()
 

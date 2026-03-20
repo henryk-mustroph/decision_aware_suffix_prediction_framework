@@ -330,10 +330,9 @@ class Mode(Decoder):
         missing_cat = [name for name in model_cat_names if name not in dataset_cat_names]
         missing_num = [name for name in model_num_names if name not in dataset_num_names]
         if missing_cat or missing_num:
-            raise ValueError(
-                "Model features are missing in dataset categories for Mode decoding. "
-                f"Missing categorical: {missing_cat}, missing numerical: {missing_num}."
-            )
+            
+            raise ValueError("Model features are missing in dataset categories for Mode decoding. "
+                             f"Missing categorical: {missing_cat}, missing numerical: {missing_num}.")
 
         self._cat_feature_indices = [dataset_cat_names.index(name) for name in model_cat_names]
         self._num_feature_indices = [dataset_num_names.index(name) for name in model_num_names]

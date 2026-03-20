@@ -1,8 +1,7 @@
 """
-Loss functions for categorical activity-sequence training.
+Loss functions for categorical event label sequence training.
 
-Includes standard and uncertainty-attenuated cross entropy variants,
-and a decision-aware guard cross-entropy for regularization.
+Includes standard and uncertainty-attenuated cross entropy variants, and a decision-aware guard cross-entropy for regularization.
 """
 
 # performance imports for torch: torch kernel uses one core only.
@@ -10,7 +9,6 @@ import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["TORCH_NUM_THREADS"] = "1" 
-
 import torch
 import torch.nn.functional as F
 

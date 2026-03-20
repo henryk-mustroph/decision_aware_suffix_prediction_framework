@@ -1,3 +1,9 @@
+"""
+According to:
+Camargo, Manuel, Marlon Dumas, and Oscar González-Rojas. "Learning accurate LSTM models of business processes." International Conference on Business Process Management. Cham: Springer International Publishing, 2019.
+"""
+
+
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"

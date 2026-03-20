@@ -1,8 +1,6 @@
 """
-According:
-Taymouri, Farbod, Marcello La Rosa, and Sarah M. Erfani,
-A deep adversarial model for suffix and remaining time prediction of event sequences,
-International Conference on Data Mining (SDM), 2021.
+According to:
+Taymouri, Farbod, Marcello La Rosa, and Sarah M. Erfani,A deep adversarial model for suffix and remaining time prediction of event sequences, International Conference on Data Mining (SDM), 2021.
 """
 
 import os
@@ -25,10 +23,7 @@ class Encoder(nn.Module):
         super().__init__()
         self.hid_dim = hidden_size
         self.n_layers = num_layers
-        self.lstm = nn.LSTM(
-            input_size, hidden_size, num_layers,
-            dropout=dropout, batch_first=True, bidirectional=False,
-        )
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, dropout=dropout, batch_first=True, bidirectional=False)
 
     def forward(self, x):
         self.lstm.flatten_parameters()
@@ -37,7 +32,9 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    """LSTM suffix decoder with fc_out + ReLU (Taymouri et al.)."""
+    """
+    LSTM suffix decoder with fc_out + ReLU.
+    """
 
     def __init__(self, input_size, hidden_size, num_layers, dropout=0.3):
         super().__init__()
@@ -45,10 +42,8 @@ class Decoder(nn.Module):
         self.n_layers = num_layers
         self.output_dim = input_size
 
-        self.rnn = nn.LSTM(
-            input_size, hidden_size, num_layers,
-            dropout=dropout, batch_first=True,
-        )
+        self.rnn = nn.LSTM(input_size, hidden_size, num_layers, dropout=dropout, batch_first=True)
+        
         self.fc_out = nn.Linear(hidden_size, input_size)
         self.relu = nn.ReLU()
 
@@ -60,7 +55,9 @@ class Decoder(nn.Module):
 
 
 class Seq2Seq(nn.Module):
-    """Sequence-to-sequence generator combining Encoder and Decoder (Taymouri et al.)."""
+    """
+    Sequence-to-sequence generator combining Encoder and Decoder
+    """
 
     def __init__(self, encoder, decoder):
         super().__init__()
@@ -105,7 +102,9 @@ class Seq2Seq(nn.Module):
 
 
 class Discriminator(nn.Module):
-    """Suffix sequence discriminator (Taymouri et al.)."""
+    """
+    Suffix sequence discriminator
+    """
 
     def __init__(self, input_size, hidden_size, num_layers, dropout=0.3):
         super().__init__()
@@ -126,43 +125,33 @@ class Discriminator(nn.Module):
 
 
 def init_weights(m):
-    """Normal weight initialization (Taymouri et al., standard normal distribution)."""
+    """
+    Normal weight initialization standard normal distribution.
+    """
     for name, param in m.named_parameters():
         nn.init.normal_(param.data, mean=0.0, std=0.08)
 
 
-# ---------------------------------------------------------------------------
-# Wrapper that composes the reference modules with an embedding layer
-# and provides the interface expected by the training / inference pipeline.
-# ---------------------------------------------------------------------------
 
+# Wrapper that composes the reference modules with an embedding layer and provides the interface expected by the training / inference pipeline.
 class TaymouriAdversarialLSTM(nn.Module):
     """
-    GAN-LSTM for suffix prediction (Taymouri et al.).
+    GAN-LSTM for suffix prediction.
 
     Wraps the reference Encoder, Decoder, Seq2Seq and Discriminator
-    with an embedding layer for mixed categorical + numerical event
-    attributes and provides beam-search decoding.
-
-    Data structure follows the same convention as C_LSTM / K_UED_LSTM:
-    - prefixes = [cats_list, nums_list] where cats_list is a list of
-      tensors per categorical feature and nums_list per numerical feature.
-    - model_feat = [cat_feature_names, num_feature_names] selects the
-      subset of dataset features used by the model.
-    - Suffix length S is fixed (seq_len_pred), same as K_UED_LSTM.
+    with an embedding layer for mixed categorical + numerical event attributes
     """
 
-    def __init__(
-        self,
-        data_set_categories: list[tuple[str, dict[str, int]]],
-        model_feat: list,
-        concept_name_id: int,
-        hidden_size: int,
-        num_layers: int,
-        seq_len_pred: int,
-        input_size: int = 1,
-        output_size_act: int | None = None,
-        dropout: float = 0.2):
+    def __init__(self,
+                 data_set_categories: list[tuple[str, dict[str, int]]],
+                 model_feat: list,
+                 concept_name_id: int,
+                 hidden_size: int,
+                 num_layers: int,
+                 seq_len_pred: int,
+                 input_size: int = 1,
+                 output_size_act: int | None = None,
+                 dropout: float = 0.2):
 
         super().__init__()
 
@@ -178,20 +167,17 @@ class TaymouriAdversarialLSTM(nn.Module):
         cat_input_feat_model, num_input_feat_model = model_feat
         cat_dict = {cat[0]: cat[1] for cat in cat_categories}
         self.activity_feature_name = cat_categories[concept_name_id][0]
-        if self.activity_feature_name not in cat_input_feat_model:
-            raise ValueError(
-                f"Activity feature '{self.activity_feature_name}' must be part of model_feat categorical inputs."
-            )
+        if self.activity_feature_name not in cat_input_feat_model:    
+            raise ValueError(f"Activity feature '{self.activity_feature_name}' must be part of model_feat categorical inputs.")
+        
         self.activity_input_index = cat_input_feat_model.index(self.activity_feature_name)
 
         classes_per_cat = [cat_dict[feat] for feat in cat_input_feat_model if feat in cat_dict]
-        if len(classes_per_cat) == 0:
+        if len(classes_per_cat) == 0: 
             raise ValueError("At least one categorical input feature is required.")
 
-        # Embeddings (same rule as C_LSTM)
-        self.embeddings = nn.ModuleList(
-            [nn.Embedding(n_cat, min(600, round(1.6 * n_cat**0.56))) for n_cat in classes_per_cat]
-        )
+        # Embeddings
+        self.embeddings = nn.ModuleList([nn.Embedding(n_cat, min(600, round(1.6 * n_cat**0.56))) for n_cat in classes_per_cat])
 
         embedding_size = sum(emb.embedding_dim for emb in self.embeddings)
 
@@ -205,30 +191,25 @@ class TaymouriAdversarialLSTM(nn.Module):
         self.output_size_act = output_size_act
 
         # Seq2Seq (Encoder + Decoder)
-        encoder = Encoder(
-            input_size=self.input_size,
-            hidden_size=self.hidden_size,
-            num_layers=self.num_layers,
-            dropout=dropout,
-        )
-        decoder = Decoder(
-            input_size=self.output_size_act,
-            hidden_size=self.hidden_size,
-            num_layers=self.num_layers,
-            dropout=dropout,
-        )
+        encoder = Encoder(input_size=self.input_size,
+                          hidden_size=self.hidden_size,
+                          num_layers=self.num_layers,
+                          dropout=dropout)
+        
+        decoder = Decoder(input_size=self.output_size_act,
+                          hidden_size=self.hidden_size,
+                          num_layers=self.num_layers,
+                          dropout=dropout)
+        
         self.seq2seq = Seq2Seq(encoder, decoder)
 
         # Discriminator
-        self.discriminator = Discriminator(
-            input_size=self.output_size_act,
-            hidden_size=self.hidden_size,
-            num_layers=1,
-            dropout=0.0,
-        )
+        self.discriminator = Discriminator(input_size=self.output_size_act,
+                                           hidden_size=self.hidden_size,
+                                           num_layers=1,
+                                           dropout=0.0)
 
-    # -- backward-compatible accessors for the trainer -----------------------
-
+    # -backward-compatible accessors for the trainer 
     @property
     def discriminator_lstm(self):
         return self.discriminator.rnn
@@ -237,16 +218,16 @@ class TaymouriAdversarialLSTM(nn.Module):
     def discriminator_head(self):
         return self.discriminator.fc_out
 
-    # -- prefix handling (same pattern as C_LSTM) ----------------------------
-
+    # prefix handling (same pattern as C_LSTM) 
     def _build_prefix_tensor(self, prefixes):
-        """Embed categorical + numerical prefix features into a single tensor.
+        """
+        Embed categorical + numerical prefix features into a single tensor.
 
-        Args:
-            prefixes: [cats_list, nums_list] where each is a list of tensors
-                      of shape [B, T] (categorical ids) or [B, T] (numerical).
-        Returns:
-            Tensor of shape [B, T, input_size].
+        Input:
+        - prefixes: [cats_list, nums_list] where each is a list of tensors of shape [B, T] (categorical ids) or [B, T] (numerical).
+        
+        Output:
+        - Tensor of shape [B, T, input_size].
         """
         cats, nums = prefixes
 
@@ -261,24 +242,24 @@ class TaymouriAdversarialLSTM(nn.Module):
         return torch.cat((merged_cats, merged_nums), dim=-1)
 
     def _build_start_input(self, prefixes):
-        """Build the first decoder input from the last prefix activity event."""
+        """
+        Build the first decoder input from the last prefix event.
+        """
         prefix_cats, _ = prefixes
         activity_ids = prefix_cats[self.activity_input_index][:, -1].long()
         return F.one_hot(activity_ids, self.output_size_act).float().unsqueeze(1)
 
-    # -- forward / generation ------------------------------------------------
-
+    # generate suffixes
     def forward(self, prefixes, target_suffix=None, teacher_forcing_ratio: float = 0.0,
                 return_teacher_forcing_mask: bool = False):
         """
-        Args:
-            prefixes: [cats_list, nums_list] — prefix event features.
-            target_suffix: LongTensor [B, S] of activity ids (for teacher forcing)
-                           or None (free-running generation).
-            teacher_forcing_ratio: probability of feeding ground-truth token.
+        Inputs:
+        - prefixes: [cats_list, nums_list] — prefix event features.
+        - target_suffix: LongTensor [B, S] of activity ids (for teacher forcing) or None (free-running generation).
+        - teacher_forcing_ratio: probability of feeding ground-truth token.
 
-        Returns:
-            Activity logits with shape [S, B, output_size_act].
+        Outputs:
+        - Activity logits with shape [S, B, output_size_act].
         """
         src = self._build_prefix_tensor(prefixes)
         start_input = self._build_start_input(prefixes)
@@ -305,16 +286,15 @@ class TaymouriAdversarialLSTM(nn.Module):
         return prediction.permute(1, 0, 2)  # [S, B, C]
 
     def discriminate(self, prefixes, suffix_activities):
-        """Run discriminator on suffix activity sequences.
+        """
+        Run discriminator on suffix activity sequences.
 
-        Args:
-            prefixes: prefix tuple (kept for API compatibility).
-            suffix_activities:
-              - LongTensor [B, S] activity ids  OR
-              - FloatTensor [B, S, C] activity probabilities.
+        Inputs:
+        - prefixes: prefix tuple (kept for API compatibility).
+        - suffix_activities
 
-        Returns:
-            Tensor [B] with probabilities of being real.
+        Outputs:
+        - Tensor [B] with probabilities of being real.
         """
         if suffix_activities.dtype == torch.long:
             suffix_input = F.one_hot(suffix_activities, self.output_size_act).float()
@@ -325,7 +305,9 @@ class TaymouriAdversarialLSTM(nn.Module):
         return torch.sigmoid(prediction[:, -1, 0])
 
     def sample_activity_ids(self, prefixes, max_len: int | None = None):
-        """Greedy argmax decoding of activity ids."""
+        """
+        Greedy argmax decoding of activity ids.
+        """
         logits = self.forward(prefixes=prefixes, target_suffix=None, teacher_forcing_ratio=0.0)
         if max_len is not None and logits.shape[0] != max_len:
             logits = logits[:max_len]
@@ -350,10 +332,8 @@ class TaymouriAdversarialLSTM(nn.Module):
             h_b = h0[:, b : b + 1, :].contiguous()
             c_b = c0[:, b : b + 1, :].contiguous()
 
-            start_inp = self._build_start_input((
-                [cat[b : b + 1] for cat in prefixes[0]],
-                [num[b : b + 1] for num in prefixes[1]],
-            ))
+            start_inp = self._build_start_input(([cat[b : b + 1] for cat in prefixes[0]], [num[b : b + 1] for num in prefixes[1]]))
+            
             beams = [([], 0.0, start_inp, h_b, c_b, False)]
 
             for _ in range(max_len):
@@ -394,23 +374,20 @@ class TaymouriAdversarialLSTM(nn.Module):
         """Initialize G and D parameters (Algorithm 1, step 1: standard normal distribution)."""
         self.apply(init_weights)
 
-    # -- persistence ---------------------------------------------------------
 
     def save(self, path: str):
         checkpoint = {
             "model_state_dict": self.state_dict(),
-            "kwargs": {
-                "data_set_categories": self.data_set_categories,
-                "model_feat": self.model_feat,
-                "concept_name_id": self.concept_name_id,
-                "hidden_size": self.hidden_size,
-                "num_layers": self.num_layers,
-                "seq_len_pred": self.seq_len_pred,
-                "input_size": self.input_size,
-                "output_size_act": self.output_size_act,
-                "dropout": self.dropout,
-            },
-        }
+            "kwargs": {"data_set_categories": self.data_set_categories,
+                       "model_feat": self.model_feat,
+                       "concept_name_id": self.concept_name_id,
+                       "hidden_size": self.hidden_size,
+                       "num_layers": self.num_layers,
+                       "seq_len_pred": self.seq_len_pred,
+                       "input_size": self.input_size,
+                       "output_size_act": self.output_size_act,
+                       "dropout": self.dropout},
+            }
         return torch.save(checkpoint, path)
 
     @staticmethod

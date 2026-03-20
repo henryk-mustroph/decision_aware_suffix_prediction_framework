@@ -4,19 +4,13 @@ import random
 import concurrent.futures
 from dataclasses import dataclass
 from typing import Literal, Optional
-
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["TORCH_NUM_THREADS"] = "1"
-
 import pandas as pd
 from tqdm.auto import tqdm
 
 from .inference import get_evaluator
 
-DecodeMode = Literal["mean", "mode", "probabilistic", "beam"]
+DecodeMode = Literal["mode", "probabilistic", "beam"]
 ProbReduction = Literal["mean", "best"]
-
 
 _PROB_WORKER_DECODER = None
 
@@ -397,11 +391,11 @@ class DLSEvaluation:
                           int(self.config.probabilistic_samples or 0))
                 ) as executor:
                 futures = [executor.submit(_collect_probabilistic_case_chunk, case_chunk) for case_chunk in case_chunks]
-                for future in tqdm(
-                    concurrent.futures.as_completed(futures),
-                    total=len(futures),
-                    desc="Probabilistic inference chunks",
-                ):
+                
+                for future in tqdm(concurrent.futures.as_completed(futures),
+                                   total=len(futures),
+                                   desc="Probabilistic inference chunks"):
+                    
                     chunk_rows = future.result()
                     samples.extend(chunk_rows)
 

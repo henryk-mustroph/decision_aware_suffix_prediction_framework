@@ -16,18 +16,17 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
     Full Encoder-Decoder architecture with droput uncertainty LSTM.
     """
 
-    def __init__(
-        self,
-        data_set_categories: list[tuple[str, dict[str, int]]],
-        enc_feat: list,
-        dec_feat: list,
-        seq_len_pred: int,
-        hidden_size: int,
-        num_layers: int,
-        dropout: float,
-        # optional static attributes
-        static_data_set_categories: Optional[list[tuple[str, dict[str, int]]]] = None,
-        static_enc_feat: Optional[list] = None):
+    def __init__(self,
+                 data_set_categories: list[tuple[str, dict[str, int]]],
+                 enc_feat: list,
+                 dec_feat: list,
+                 seq_len_pred: int,
+                 hidden_size: int,
+                 num_layers: int,
+                 dropout: float,
+                 # optional static attributes
+                 static_data_set_categories: Optional[list[tuple[str, dict[str, int]]]] = None,
+                 static_enc_feat: Optional[list] = None):
         """
         Full Encoder-Decoder architecture with droput uncertainty LSTM.
 
@@ -135,9 +134,7 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
             else:
                 self.embeddings_static_enc = None
                 static_embedding_size = 0
-            print(
-                "Total embedding feature size encoder (static): ", static_embedding_size
-            )
+            print("Total embedding feature size encoder (static): ", static_embedding_size)
 
             if static_enc_label_nums:
                 static_num_size = sum(static_enc_label_nums)
@@ -150,74 +147,60 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
             print("Static encoder feature size: ", self.static_input_size_enc)
 
             # Define Encoder
-            self.encoder = DropoutUncertaintyLSTMEncoder(
-                hidden_size=hidden_size,
-                # dynamics
-                embeddings=self.embeddings_enc,
-                data_indices_enc=self.data_indices_enc,
-                input_size=self.input_size_enc,
-                # layers
-                num_layers=num_layers,
-                # static feat
-                static_embeddings=self.embeddings_static_enc,
-                static_data_indices=self.static_data_indices_enc,
-                static_input_size=self.static_input_size_enc,
-                # dropout
-                dropout=dropout)
+            self.encoder = DropoutUncertaintyLSTMEncoder(hidden_size=hidden_size,
+                                                         # dynamics
+                                                         embeddings=self.embeddings_enc,
+                                                         data_indices_enc=self.data_indices_enc,
+                                                         input_size=self.input_size_enc,
+                                                         # layers
+                                                         num_layers=num_layers,
+                                                         # static feat
+                                                         static_embeddings=self.embeddings_static_enc,
+                                                         static_data_indices=self.static_data_indices_enc,
+                                                         static_input_size=self.static_input_size_enc,
+                                                         # dropout
+                                                         dropout=dropout)
 
         else:
             print("No static encoder features configured.")
 
             # Define Encoder
-            self.encoder = DropoutUncertaintyLSTMEncoder(
-                hidden_size=hidden_size,
-                # dynamics
-                embeddings=self.embeddings_enc,
-                data_indices_enc=self.data_indices_enc,
-                input_size=self.input_size_enc,
-                # layers
-                num_layers=num_layers,
-                # dropout
-                dropout=dropout,
-            )
+            self.encoder = DropoutUncertaintyLSTMEncoder(hidden_size=hidden_size,
+                                                         # dynamics
+                                                         embeddings=self.embeddings_enc,
+                                                         data_indices_enc=self.data_indices_enc,
+                                                         input_size=self.input_size_enc,
+                                                         # layers
+                                                         num_layers=num_layers,
+                                                         # dropout
+                                                         dropout=dropout,
+                                                        )
         print("Encoder initialized! \n")
 
         # Decoder
         # Get list of category label values for cat and num
-        dec_label_cats, dec_label_nums = self.__get_list_labels_input(
-            data_set_categories=data_set_categories, model_type_feats=dec_feat
-        )
-        print(
-            "Decoder label values size for each categorical input feature: ",
-            dec_label_cats,
-        )
-        print(
-            "Decoder label values size for each numerical input feature: ",
-            dec_label_nums,
-        )
+        dec_label_cats, dec_label_nums = self.__get_list_labels_input(data_set_categories=data_set_categories, model_type_feats=dec_feat)
+        
+        print("Decoder label values size for each categorical input feature: ",
+              dec_label_cats,)
+        
+        print("Decoder label values size for each numerical input feature: ",
+              dec_label_nums,)
 
-        data_cat_indices_dec, data_num_indices_dec = self.__get_list_tensor_indeces(
-            data_set_categories=data_set_categories, model_type_feats=dec_feat
-        )
+        data_cat_indices_dec, data_num_indices_dec = self.__get_list_tensor_indeces(data_set_categories=data_set_categories, model_type_feats=dec_feat)
         self.data_indices_dec = [data_cat_indices_dec, data_num_indices_dec]
-        print(
-            "Decoder indices of tensors in dataset used as input: ",
-            self.data_indices_dec,
-        )
+        
+        print("Decoder indices of tensors in dataset used as input: ",
+              self.data_indices_dec,)
 
         # Create embeddings for categorical features
-        self.embeddings_dec = nn.ModuleList(
-            [
-                nn.Embedding(n_cat, min(600, round(1.6 * n_cat**0.56)))
-                for n_cat in dec_label_cats
-            ]
-        )
+        self.embeddings_dec = nn.ModuleList([nn.Embedding(n_cat, min(600, round(1.6 * n_cat**0.56))) for n_cat in dec_label_cats])
+        
         print("Embeddings decoder: ", self.embeddings_dec)
 
         # Compute total input size decoder
-        embedding_size_dec = sum(
-            [min(600, round(1.6 * n_cat**0.56)) for n_cat in dec_label_cats]
-        )
+        embedding_size_dec = sum([min(600, round(1.6 * n_cat**0.56)) for n_cat in dec_label_cats])
+        
         print("Total embedding feature size decoder: ", embedding_size_dec)
 
         num_size_dec = sum(dec_label_nums)
@@ -227,33 +210,27 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
         print("Input feature size decoder: ", self.input_size_dec)
 
         # Dictionary of output features and output_sizes
-        self.output_sizes = self.__get_list_dict_labels_output(
-            data_set_categories=data_set_categories, model_type_feats=dec_feat
-        )
+        self.output_sizes = self.__get_list_dict_labels_output(data_set_categories=data_set_categories, model_type_feats=dec_feat)
+        
         # Categorical-only setup: keep only categorical output heads
         self.output_sizes[1] = {}
-        print(
-            "Output feature list of dicts (featue name, feature output size)"
-            " of decoder:",
-            self.output_sizes,
-        )
+        print("Output feature list of dicts (featue name, feature output size)"
+              " of decoder:",
+             self.output_sizes,)
 
         # Define Decoder
-        self.decoder = DropoutUncertaintyLSTMDecoder(
-            input_size=self.input_size_dec,
-            hidden_size=hidden_size,
-            output_sizes=self.output_sizes,
-            embeddings=self.embeddings_dec,
-            data_indices_dec=self.data_indices_dec,
-            num_layers=num_layers,
-            dropout=dropout,
-        )
+        self.decoder = DropoutUncertaintyLSTMDecoder(input_size=self.input_size_dec,
+                                                     hidden_size=hidden_size,
+                                                     output_sizes=self.output_sizes,
+                                                     embeddings=self.embeddings_dec,
+                                                     data_indices_dec=self.data_indices_dec,
+                                                     num_layers=num_layers,
+                                                     dropout=dropout)
         print("Decoder initialized! \n")
 
         # List containing two dicts: One for categorical, one for numerical
-        self.output_feature_indeces = self.__get_list_dict_feature_index(
-            data_set_categories=data_set_categories, model_type_feats=dec_feat
-        )
+        self.output_feature_indeces = self.__get_list_dict_feature_index(data_set_categories=data_set_categories, model_type_feats=dec_feat)
+        
         # Categorical-only setup: keep only categorical output indices
         self.output_feature_indeces[1] = {}
 
@@ -261,8 +238,7 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
         """
         Gets number of feature attributes used as input of model.
 
-        Returns two lists (categorical, numerical) containing the number of feature
-        attributes (e.g.: 28 activity labels for concept:name).
+        Returns two lists (categorical, numerical) containing the number of feature attributes.
         """
         # Unpack categories
         cat_categories, num_categories = data_set_categories
@@ -273,12 +249,9 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
         num_dict = {num[0]: num[1] for num in num_categories}
 
         # Get input feature sizes to determine the model input size
-        label_cats = [
-            cat_dict[cat_feat] for cat_feat in cat_feat_model if cat_feat in cat_dict
-        ]
-        label_nums = [
-            num_dict[num_feat] for num_feat in num_feat_model if num_feat in num_dict
-        ]
+        label_cats = [cat_dict[cat_feat] for cat_feat in cat_feat_model if cat_feat in cat_dict]
+        
+        label_nums = [num_dict[num_feat] for num_feat in num_feat_model if num_feat in num_dict]
 
         return label_cats, label_nums
 
@@ -298,12 +271,9 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
         num_feat_set = set(num_feat_model)
 
         # Get indices of tensors used as input of model
-        cat_indices = [
-            i for i, cat in enumerate(cat_categories) if cat[0] in cat_feat_set
-        ]
-        num_indices = [
-            i for i, num in enumerate(num_categories) if num[0] in num_feat_set
-        ]
+        cat_indices = [i for i, cat in enumerate(cat_categories) if cat[0] in cat_feat_set]
+        
+        num_indices = [i for i, num in enumerate(num_categories) if num[0] in num_feat_set]
 
         return cat_indices, num_indices
 
@@ -571,18 +541,16 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
         """
         checkpoint = {
             "model_state_dict": self.state_dict(),
-            "kwargs": {
-                "data_set_categories": self.data_set_categories,
-                "enc_feat": self.enc_feat,
-                "dec_feat": self.dec_feat,
-                "seq_len_pred": self.seq_len_pred,
-                "hidden_size": self.hidden_size,
-                "num_layers": self.num_layers,
-                "dropout": self.dropout,
-                "static_data_set_categories": self.static_data_set_categories,
-                "static_enc_feat": self.static_enc_feat,
-            },
-        }
+            "kwargs": {"data_set_categories": self.data_set_categories,
+                       "enc_feat": self.enc_feat,
+                       "dec_feat": self.dec_feat,
+                       "seq_len_pred": self.seq_len_pred,
+                       "hidden_size": self.hidden_size,
+                       "num_layers": self.num_layers,
+                       "dropout": self.dropout,
+                       "static_data_set_categories": self.static_data_set_categories,
+                       "static_enc_feat": self.static_enc_feat,},
+            }
         return torch.save(checkpoint, path)
 
     @staticmethod
@@ -637,9 +605,7 @@ class DropoutUncertaintyLSTMDecoder(nn.Module):
         self.act = nn.ReLU()
 
         # Create a first cell:
-        self.first_layer = DropoutUncertaintyLSTMCell(
-            input_size=hidden_size, hidden_size=hidden_size, dropout=dropout
-        )
+        self.first_layer = DropoutUncertaintyLSTMCell(input_size=hidden_size, hidden_size=hidden_size, dropout=dropout)
 
         # Create multiple LSTM cells based on num_layer
         self.hidden_layers = nn.ModuleList([DropoutUncertaintyLSTMCell(input_size=hidden_size, hidden_size=hidden_size, dropout=dropout)for _ in range(num_layers - 1)])
@@ -680,7 +646,6 @@ class DropoutUncertaintyLSTMDecoder(nn.Module):
 
     def __data_enc_for_model(self, data, pred):
         """
-        Transform the dataloader input.
         Transofrms prefix or suffix input into a tensor structure for the encoder.
         """
         if pred:
@@ -697,14 +662,11 @@ class DropoutUncertaintyLSTMDecoder(nn.Module):
         if len(nums) == 0 and len(self.data_indices_dec[1]) > 0:
             batch_size = cats[0].shape[0]
             seq_len = cats[0].shape[1]
-            nums = [
-                torch.zeros(batch_size, seq_len, device=cats[0].device)
-                for _ in self.data_indices_dec[1]
-            ]
+            
+            nums = [torch.zeros(batch_size, seq_len, device=cats[0].device) for _ in self.data_indices_dec[1]]
 
-        assert len(cats) == len(self.data_indices_dec[0]) and len(nums) == len(
-            self.data_indices_dec[1]
-        ), "Decoder: Number of input tensor is unequal the number of indices"
+        assert len(cats) == len(self.data_indices_dec[0]) and len(nums) == len(self.data_indices_dec[1]
+                                                                               ), "Decoder: Number of input tensor is unequal the number of indices"
 
         # Embedd categorical tensors
         embedded_cats = []
@@ -748,9 +710,7 @@ class DropoutUncertaintyLSTMDecoder(nn.Module):
         prediction_vars = [{}, {}] 
 
         # Process the input event through the encoder
-        event = self.__data_enc_for_model(
-            data=input, pred=pred
-        )  # dim: Tensor: seq_len x batch_size x input feature
+        event = self.__data_enc_for_model(data=input, pred=pred)  # dim: Tensor: seq_len x batch_size x input feature
 
         input_proj = self.input_proj(event)
         input_proj = self.layernorm(input_proj)
@@ -760,14 +720,10 @@ class DropoutUncertaintyLSTMDecoder(nn.Module):
         if z is None:
             z_hidden_layers = []
             # Pass input_event through the first LSTM layer and all hidden layers
-            outputs, (h, c), z_first_layer = self.first_layer(
-                input=input_proj, hx=hx, z=None
-            )
+            outputs, (h, c), z_first_layer = self.first_layer(input=input_proj, hx=hx, z=None)
 
             for _, lstm_cell in enumerate(self.hidden_layers):
-                outputs, (h, c), z_hidden_layer = lstm_cell(
-                    input=outputs, hx=(h, c), z=None
-                )
+                outputs, (h, c), z_hidden_layer = lstm_cell(input=outputs, hx=(h, c), z=None)
                 z_hidden_layers.append(z_hidden_layer)
 
             z = (z_first_layer, z_hidden_layers)
@@ -855,9 +811,7 @@ class DropoutUncertaintyLSTMEncoder(nn.Module):
         self.static_input_size = static_input_size or 0
 
         # Linear projection before inserted into LSTM layers
-        total_input_size = input_size + (
-            self.static_input_size if self.static_input_size > 0 else 0
-        )
+        total_input_size = input_size + (self.static_input_size if self.static_input_size > 0 else 0)
         self.input_proj = nn.Linear(total_input_size, hidden_size)
         self.layernorm = nn.LayerNorm(hidden_size)
         self.act = nn.ReLU()
@@ -867,13 +821,13 @@ class DropoutUncertaintyLSTMEncoder(nn.Module):
 
         # Create multiple LSTM cells based on num_layer
         self.hidden_layers = nn.ModuleList([DropoutUncertaintyLSTMCell(input_size=hidden_size, hidden_size=hidden_size, dropout=dropout)
-                                            for _ in range(num_layers - 1)]
-                                           )
+                                            for _ in range(num_layers - 1)])
 
     def regularizer(self) -> Tuple[float, float]:
         """
         L2 regularization of Encoder weights, biases and dropout.
         """
+        
         total_weight_reg, total_bias_reg = self.first_layer.regularizer()
 
         for layer in self.hidden_layers:
@@ -933,18 +887,12 @@ class DropoutUncertaintyLSTMEncoder(nn.Module):
             if mask.shape[1] != seq_len:
                 # Assuming left-aligned prefix (standard for [:-suffix]),  sk
                 mask = mask[:, :seq_len]
-            mask_seq = (
-                mask.to(device=prefixes.device, dtype=prefixes.dtype)
-                .transpose(0, 1)
-                .contiguous()
-            )
+            mask_seq = (mask.to(device=prefixes.device, dtype=prefixes.dtype).transpose(0, 1).contiguous())
 
             # Apply mask to prefixes to ensure padded inputs are zero
             prefixes = prefixes * mask_seq.unsqueeze(-1)
 
-        outputs, (h, c), _ = self.first_layer(
-            input=prefixes, hx=None, z=None, mask=mask_seq
-        )
+        outputs, (h, c), _ = self.first_layer(input=prefixes, hx=None, z=None, mask=mask_seq)
 
         # Pass through the remaining LSTM cell: Layer gets for: input: h_n Tensor,
         # hx: (h, c)
@@ -954,7 +902,9 @@ class DropoutUncertaintyLSTMEncoder(nn.Module):
         return (h, c)
 
     def __data_enc_model(self, data):
-        """Dynamic attribute model encoder."""
+        """
+        Dynamic attribute model encoder.
+        """
         # cats dims: list (n categorical values):
         # Each with Tensor: batch_size x (window_size - suffix size)
         cats = [data[0][i] for i in self.data_indices_enc[0]]
@@ -975,18 +925,16 @@ class DropoutUncertaintyLSTMEncoder(nn.Module):
             merged_nums = torch.cat([num.unsqueeze(2) for num in nums], dim=-1)
         else:
             merged_nums = torch.tensor([], device=merged_cats.device)
-        prefixes = torch.cat((merged_cats, merged_nums), dim=-1).permute(
-            1, 0, 2
-        )  # dim: seq_len x batch_size x input_features
+        prefixes = torch.cat((merged_cats, merged_nums), dim=-1).permute(1, 0, 2)  # dim: seq_len x batch_size x input_features
         return prefixes
 
-    def __static_data_enc_model(
-        self,
-        static_inputs: Optional[Union[Tensor, List, Tuple, dict]],
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
-    ) -> Optional[Tensor]:
-        """Static attribute model encoder."""
+    def __static_data_enc_model(self,
+                                static_inputs: Optional[Union[Tensor, List, Tuple, dict]],
+                                device: Optional[torch.device] = None,
+                                dtype: Optional[torch.dtype] = None,) -> Optional[Tensor]:
+        """
+        Static attribute model encoder.
+        """
         if static_inputs is None or self.static_input_size == 0:
             return None
 
@@ -994,22 +942,15 @@ class DropoutUncertaintyLSTMEncoder(nn.Module):
         static_cats = None
         static_nums = None
         if isinstance(static_inputs, dict):
-            static_cats = static_inputs.get(
-                "static_cats", static_inputs.get("cats", None)
-            )
-            static_nums = static_inputs.get(
-                "static_nums", static_inputs.get("nums", None)
-            )
+            static_cats = static_inputs.get("static_cats", static_inputs.get("cats", None))
+            
+            static_nums = static_inputs.get("static_nums", static_inputs.get("nums", None))
         elif isinstance(static_inputs, (list, tuple)):
             if len(static_inputs) != 2:
-                raise TypeError(
-                    "static_inputs tuple/list must be (static_cats, static_nums)"
-                )
+                raise TypeError("static_inputs tuple/list must be (static_cats, static_nums)")
             static_cats, static_nums = static_inputs
         else:
-            raise TypeError(
-                "static_inputs must be a tuple/list(static_cats, static_nums) or a dict"
-            )
+            raise TypeError("static_inputs must be a tuple/list(static_cats, static_nums) or a dict")
 
         merged_static_cats = None
         if static_cats is not None and len(self.static_embeddings) > 0:
@@ -1038,9 +979,7 @@ class DropoutUncertaintyLSTMEncoder(nn.Module):
                     static_nums = static_nums.unsqueeze(0)
                 merged_static_nums = static_nums
             else:
-                merged_static_nums = torch.cat(
-                    [num.unsqueeze(1) for num in static_nums], dim=-1
-                )
+                merged_static_nums = torch.cat([num.unsqueeze(1) for num in static_nums], dim=-1)
 
         if merged_static_cats is not None and device is not None:
             merged_static_cats = merged_static_cats.to(device=device, dtype=dtype)
@@ -1061,15 +1000,14 @@ class DropoutUncertaintyLSTMCell(nn.Module):
     """
     LSTM cell with MC Dropout for uncertainty estimation.
     """
-
     def __init__(self, input_size: int, hidden_size: int, dropout: float):
         """
         Initializes LSTM cell with MC Dropout.
 
         Args:
-            input_size (int): Size of input features.
-            hidden_size (int): Size of hidden layer.
-            dropout (float): Dropout probability, must be in [0, 1).
+        - input_size (int): Size of input features.
+        - hidden_size (int): Size of hidden layer.
+        - dropout (float): Dropout probability, must be in [0, 1).
         """
         super(DropoutUncertaintyLSTMCell, self).__init__()
 
@@ -1151,12 +1089,8 @@ class DropoutUncertaintyLSTMCell(nn.Module):
         t = 1e-1
 
         # tensors with random values:
-        ux = torch.rand(
-            GATES, B, self.input_size, device=device, dtype=torch.float32
-        )  # dim gates x batch_size x input_size
-        uh = torch.rand(
-            GATES, B, self.hidden_size, device=device, dtype=torch.float32
-        )  # dim (gates=weight matrices per cell x batch_size x hidden_size)
+        ux = torch.rand(GATES, B, self.input_size, device=device, dtype=torch.float32) # dim gates x batch_size x input_size
+        uh = torch.rand(GATES, B, self.hidden_size, device=device, dtype=torch.float32) # dim (gates=weight matrices per cell x batch_size x hidden_size)
 
         # Dropout masks: containing values near 1 for keeping weights,
         # and near 0 for dropping weights for each gate and batch
@@ -1180,21 +1114,10 @@ class DropoutUncertaintyLSTMCell(nn.Module):
         # For MC-dropout-as-variational-inference:
         # the KL/L2 term is typically scaled by (1-p) rather than 1/(1-p).
         keep_prob = 1.0 - p
-        weight_sum = (
-            sum(
-                torch.sum(params**2)
-                for name, params in self.named_parameters()
-                if name.endswith("weight")
-            )
-            * keep_prob
-        )
+        weight_sum = ( sum(torch.sum(params**2) for name, params in self.named_parameters() if name.endswith("weight")) * keep_prob)
 
         # Bias L2 sum
-        bias_sum = sum(
-            torch.sum(params**2)
-            for name, params in self.named_parameters()
-            if name.endswith("bias")
-        )
+        bias_sum = sum(torch.sum(params**2) for name, params in self.named_parameters() if name.endswith("bias"))
 
         return weight_sum, bias_sum
 
@@ -1206,13 +1129,13 @@ class DropoutUncertaintyLSTMCell(nn.Module):
         """
         Performs forward pass of LSTM cell with MC Dropout.
 
-        INPUTS:
+        Inputs:
         - input: Input tensor with shape (sequence, batch, input dimension)
         - hx: h_t: hidden state and c_t: cell state as tuple at time step (event t)
         - z: dropout masks for LSTM weights
         - mask:
 
-        OUTPUTS:
+        Outputs:
         - hn: List of all hidden states: h_1, ... h_n
         - (h_t, c_t): Last hidden and cell state
         - (zx, zh): Applied MC dropout masks
