@@ -4,3 +4,5 @@ data/*
 eval_results/*
 
 models/*
+
+__pycache__/
