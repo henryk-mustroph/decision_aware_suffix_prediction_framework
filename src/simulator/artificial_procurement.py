@@ -8,12 +8,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Configuration
 
-# The attribute values are chosen so that the decision-mining
-# pipeline discovers human-readable guards that mix *interval*
-# conditions (amount thresholds) and *categorical* conditions
-# (department, supplier_type, priority, …).  Every XOR split
-# in the process is governed by a deterministic rule (+ light
-# noise) that can be recovered by a surrogate decision tree.
+# The attribute values are chosen so that the decision-mining pipeline discovers human-readable guards that mix interval conditions (amount thresholds) and categorical conditions
+# (department, supplier_type, priority, …).  Every XOR split in the process is governed by a deterministic rule (+ light noise) that can be recovered by a surrogate decision tree.
+# created with the help of GenAI.
 
 # Resources 
 REQUESTERS = [
@@ -48,7 +45,6 @@ CATEGORIES = ["hardware", "software", "consulting", "office", "maintenance"]
 # Each case receives exactly one priority.
 PRIORITIES = ["low", "medium", "high", "critical"]
 
-
 # Data structures
 @dataclass
 class Event:
@@ -57,7 +53,6 @@ class Event:
     timestamp: datetime
     resource: str
     event_attributes: Dict[str, Any]
-
 
 
 # Simulator
@@ -481,10 +476,7 @@ class ProcurementSimulator:
         return dt.strftime('%Y-%m-%d %H:%M:%S.%f')
 
 
-# ============================================================
 # Example usage
-# ============================================================
-
 if __name__ == "__main__":
     simulator = ProcurementSimulator(
         seed=7,

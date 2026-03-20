@@ -10,7 +10,6 @@ import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["TORCH_NUM_THREADS"] = "1" 
-
 import torch
 import torch.nn.functional as F
 from tqdm.notebook import tqdm
@@ -20,7 +19,6 @@ from tqdm.notebook import tqdm
 from data_processing.decision_labeling import DecisionLabeler
 # use the inference modes implemented also in the standard case
 from .inference import Mode, Beam, MCSA
-
 
 @dataclass
 class DecisionGuidanceConfig:
@@ -32,15 +30,15 @@ class DecisionGuidanceConfig:
     alpha: float = 0.1
     support_threshold: float = 0.05
 
-
 class DecisionRuleGuidedMixin:
     """
     Shared decision-guidance and reasoning helpers for all decoders.
     """
     def _init_decision_guidance(self,
-                             decision_labeler: DecisionLabeler,
-                             guidance_config: Optional[DecisionGuidanceConfig] = None,
-                             decision_places_bundle_path: Optional[str] = None) -> None:
+                                decision_labeler: DecisionLabeler,
+                                guidance_config: Optional[DecisionGuidanceConfig] = None,
+                                decision_places_bundle_path: Optional[str] = None) -> None:
+        
         self.decision_labeler = decision_labeler
         self.guidance_config = guidance_config or DecisionGuidanceConfig()
         self._reasoning_bundle_guards = self._load_reasoning_guards(decision_places_bundle_path)
@@ -96,9 +94,8 @@ class DecisionRuleGuidedMixin:
         return attrs
 
     def _decode_event_attrs_from_predicted_ids(self,
-                                            predicted_cat_ids: Dict[str, int],
-                                            predicted_num_values: Optional[Dict[str, float]] = None
-                                            ) -> Dict[str, Any]:
+                                               predicted_cat_ids: Dict[str, int],
+                                               predicted_num_values: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
         attrs: Dict[str, Any] = {}
 
         for feature_name, token_id in predicted_cat_ids.items():
@@ -119,10 +116,10 @@ class DecisionRuleGuidedMixin:
         return attrs
 
     def _decode_event_attrs_from_suffix_step(self,
-                                          suffix: Tuple[List[torch.Tensor], List[torch.Tensor]],
-                                          step_idx: int,
-                                          activity_id: int,
-                                          static_inputs: Any,) -> Dict[str, Any]:
+                                             suffix: Tuple[List[torch.Tensor], List[torch.Tensor]],
+                                             step_idx: int,
+                                             activity_id: int,
+                                             static_inputs: Any,) -> Dict[str, Any]:
         """
         Build event attributes using predicted activity and GT non-activity attrs at step_idx.
         """
@@ -143,19 +140,16 @@ class DecisionRuleGuidedMixin:
                 continue
             num_vals[feature_name] = float(suffix_nums[i][0, step_idx].item())
 
-        next_event_attrs = self._decode_event_attrs_from_predicted_ids(
-            predicted_cat_ids=cat_ids,
-            predicted_num_values=num_vals,
-        )
+        next_event_attrs = self._decode_event_attrs_from_predicted_ids(predicted_cat_ids=cat_ids,
+                                                                       predicted_num_values=num_vals)
         next_event_attrs.update(self._extract_static_attrs(static_inputs))
         return self.decision_labeler._filter_attributes(next_event_attrs)
 
-    def _roll_prefix_with_activity_from_suffix(
-        self,
-        prefix: Tuple[List[torch.Tensor], List[torch.Tensor]],
-        suffix: Tuple[List[torch.Tensor], List[torch.Tensor]],
-        step_idx: int,
-        activity_id: int) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    def _roll_prefix_with_activity_from_suffix(self,
+                                               prefix: Tuple[List[torch.Tensor], List[torch.Tensor]],
+                                               suffix: Tuple[List[torch.Tensor], List[torch.Tensor]],
+                                               step_idx: int,
+                                               activity_id: int) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
         Roll prefix and append predicted activity with GT non-activity attributes at step_idx.
         """
@@ -214,8 +208,8 @@ class DecisionRuleGuidedMixin:
         return out
 
     def _build_initial_past_events(self,
-                                prefix: Tuple[List[torch.Tensor], List[torch.Tensor]],
-                                static_inputs: Any) -> List[Dict[str, Any]]:
+                                   prefix: Tuple[List[torch.Tensor], List[torch.Tensor]],
+                                   static_inputs: Any) -> List[Dict[str, Any]]:
         cats, _ = prefix
         activity_tensor = cats[self.concept_name_id][0]
         static_attrs = self._extract_static_attrs(static_inputs)
@@ -225,9 +219,8 @@ class DecisionRuleGuidedMixin:
             token = int(activity_tensor[t].item())
             if token == 0:
                 continue
-            attrs = self._decode_event_attrs_from_prefix_last(
-                ([cat[:, : t + 1] for cat in prefix[0]], [num[:, : t + 1] for num in prefix[1]])
-            )
+            attrs = self._decode_event_attrs_from_prefix_last(([cat[:, : t + 1] for cat in prefix[0]], [num[:, : t + 1] for num in prefix[1]]))
+            
             attrs.update(static_attrs)
             attrs = self.decision_labeler._filter_attributes(attrs)
             events.append(attrs)
@@ -237,6 +230,7 @@ class DecisionRuleGuidedMixin:
     def _get_decision_context(self,
                            current_input_activity: str,
                            past_events: List[Dict[str, Any]]) -> Optional[Tuple[str, Dict[str, float], float]]:
+        
         transitions = self.decision_labeler.transition_by_label.get(str(current_input_activity), [])
         if len(transitions) == 0:
             return None
@@ -251,13 +245,7 @@ class DecisionRuleGuidedMixin:
         c_i = max(z_i.values(), default=0.0)
         return place_name, z_i, float(c_i)
 
-    def _masked_distribution(
-        self,
-        base_probs: torch.Tensor,
-        z_i: Dict[str, float],
-        c_i: float,
-        step_idx: int,
-    ) -> torch.Tensor:
+    def _masked_distribution(self, base_probs: torch.Tensor, z_i: Dict[str, float], c_i: float, step_idx: int) -> torch.Tensor:
         if len(z_i) == 0:
             return base_probs
 
@@ -333,17 +321,13 @@ class DecisionRuleGuidedMixin:
 
         return True
 
-    def _best_matching_guard(
-        self,
-        place_name: str,
-        next_activity_label: str,
-        past_events: List[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
-        guards = (
-            self._reasoning_bundle_guards
-            .get(place_name, {})
-            .get(str(next_activity_label), [])
-        )
+    def _best_matching_guard(self,
+                             place_name: str,
+                             next_activity_label: str,
+                             past_events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        
+        guards = (self._reasoning_bundle_guards.get(place_name, {}).get(str(next_activity_label), []))
+        
         if len(guards) == 0:
             return None
 
@@ -352,22 +336,18 @@ class DecisionRuleGuidedMixin:
         if len(matches) == 0:
             return None
 
-        matches.sort(
-            key=lambda g: (
-                float(g.get("score", 0.0)),
-                float(g.get("prob_model", 0.0)),
-                float(g.get("support", 0.0)),
-            ),
-            reverse=True,
-        )
+        matches.sort(key=lambda g: (float(g.get("score", 0.0)), float(g.get("prob_model", 0.0)), float(g.get("support", 0.0))),
+                     reverse=True)
+        
         return matches[0]
 
-    def _build_attribute_checks(
-        self,
-        feature_row: Dict[str, Any],
-        guard: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        """Build per-attribute membership checks used in local reasoning output."""
+    def _build_attribute_checks(self,
+                                feature_row: Dict[str, Any],
+                                guard: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Build per-attribute membership checks used in local reasoning output.
+        """
+        
         checks: List[Dict[str, Any]] = []
 
         intervals = guard.get("intervals", {}) or {}
@@ -385,56 +365,45 @@ class DecisionRuleGuidedMixin:
             if in_rule_set and high is not None:
                 in_rule_set = bool(val <= high)
 
-            checks.append(
-                {
-                    "attr": str(feat),
-                    "value": None if val is None else float(val),
-                    "in_rule_set": bool(in_rule_set),
-                    "rule_type": "interval",
-                    "low": None if low is None else float(low),
-                    "high": None if high is None else float(high),
-                }
-            )
+            checks.append({"attr": str(feat),
+                           "value": None if val is None else float(val),
+                           "in_rule_set": bool(in_rule_set),
+                           "rule_type": "interval",
+                           "low": None if low is None else float(low),
+                           "high": None if high is None else float(high)})
 
         for feat, values in allowed.items():
             val = feature_row.get(feat, None)
             allowed_set = {str(v) for v in values}
             in_rule_set = val is not None and str(val) in allowed_set
-            checks.append(
-                {
-                    "attr": str(feat),
-                    "value": None if val is None else str(val),
-                    "in_rule_set": bool(in_rule_set),
-                    "rule_type": "categorical_allowed",
-                    "allowed": sorted(list(allowed_set)),
-                }
-            )
+            
+            checks.append({"attr": str(feat),
+                           "value": None if val is None else str(val),
+                           "in_rule_set": bool(in_rule_set),
+                           "rule_type": "categorical_allowed",
+                           "allowed": sorted(list(allowed_set))})
 
         for feat, values in excluded.items():
             val = feature_row.get(feat, None)
             excluded_set = {str(v) for v in values}
             in_rule_set = val is None or str(val) not in excluded_set
-            checks.append(
-                {
-                    "attr": str(feat),
-                    "value": None if val is None else str(val),
-                    "in_rule_set": bool(in_rule_set),
-                    "rule_type": "categorical_excluded",
-                    "excluded": sorted(list(excluded_set)),
-                }
-            )
+            
+            checks.append({"attr": str(feat),
+                           "value": None if val is None else str(val),
+                           "in_rule_set": bool(in_rule_set),
+                           "rule_type": "categorical_excluded",
+                           "excluded": sorted(list(excluded_set))})
 
         return checks
 
-    def _append_reasoning_step(
-        self,
-        step_idx: int,
-        input_activity: str,
-        selected_activity: str,
-        decision_context: Optional[Tuple[str, Dict[str, float], float]],
-        past_events: List[Dict[str, Any]],
-        model_prob: Optional[float] = None,
-    ) -> None:
+    def _append_reasoning_step(self,
+                               step_idx: int,
+                               input_activity: str,
+                               selected_activity: str,
+                               decision_context: Optional[Tuple[str, Dict[str, float], float]],
+                               past_events: List[Dict[str, Any]],
+                               model_prob: Optional[float] = None) -> None:
+        
         if decision_context is None:
             return
 
@@ -462,31 +431,26 @@ class DecisionRuleGuidedMixin:
                 explanation_status = "explained"
                 explained = True
 
-        self.last_reasoning_trace.append(
-            {
-                "step": int(step_idx),
-                "place": place_name,
-                "input_event": str(input_activity),
-                "next_event": str(selected_activity),
-                "model_prob": float(model_prob) if model_prob is not None else None,
-                "confidence": float(c_i),
-                "decision_top_event": top_decision_event,
-                "decision_top_prob": top_decision_prob,
-                "supported_set": [str(a) for a in supported],
-                "conflict": bool(conflict),
-                "explained": bool(explained),
-                "explanation_status": str(explanation_status),
-                "decision_distribution": {k: float(v) for k, v in z_i.items()},
-                "attribute_checks": attribute_checks,
-                "matched_rule": None if matched_guard is None else {
-                    "rule": matched_guard.get("rule", ""),
-                    "raw_rule": matched_guard.get("raw_rule", ""),
-                    "prob_model": float(matched_guard.get("prob_model", 0.0)),
-                    "support": int(matched_guard.get("support", 0)),
-                    "score": float(matched_guard.get("score", 0.0)),
-                },
-            }
-        )
+        self.last_reasoning_trace.append({"step": int(step_idx),
+                                          "place": place_name,
+                                          "input_event": str(input_activity),
+                                          "next_event": str(selected_activity),
+                                          "model_prob": float(model_prob) if model_prob is not None else None,
+                                          "confidence": float(c_i),
+                                          "decision_top_event": top_decision_event,
+                                          "decision_top_prob": top_decision_prob,
+                                          "supported_set": [str(a) for a in supported],
+                                          "conflict": bool(conflict),
+                                          "explained": bool(explained),
+                                          "explanation_status": str(explanation_status),
+                                          "decision_distribution": {k: float(v) for k, v in z_i.items()},
+                                          "attribute_checks": attribute_checks,
+                                          "matched_rule": None if matched_guard is None else {"rule": matched_guard.get("rule", ""),
+                                                                                              "raw_rule": matched_guard.get("raw_rule", ""),
+                                                                                              "prob_model": float(matched_guard.get("prob_model", 0.0)),
+                                                                                              "support": int(matched_guard.get("support", 0)),
+                                                                                              "score": float(matched_guard.get("score", 0.0))},
+                                          })
 
     def summarize_last_reasoning(self) -> Dict[str, Any]:
         rate = 0.0
@@ -495,14 +459,13 @@ class DecisionRuleGuidedMixin:
         explained_rate = 0.0
         if self.last_decision_steps > 0:
             explained_rate = float(self.last_explained_steps) / float(self.last_decision_steps)
-        return {
-            "decision_steps": int(self.last_decision_steps),
-            "conflicts": int(self.last_conflicts),
-            "conflict_rate": float(rate),
-            "explained_steps": int(self.last_explained_steps),
-            "explained_rate": float(explained_rate),
-            "trace": list(self.last_reasoning_trace),
-        }
+        
+        return {"decision_steps": int(self.last_decision_steps),
+                "conflicts": int(self.last_conflicts),
+                "conflict_rate": float(rate),
+                "explained_steps": int(self.last_explained_steps),
+                "explained_rate": float(explained_rate),
+                "trace": list(self.last_reasoning_trace)}
 
     def _reset_reasoning_state(self) -> None:
         self.last_reasoning_trace = []
@@ -512,18 +475,19 @@ class DecisionRuleGuidedMixin:
 
 
 class GuidedMode(DecisionRuleGuidedMixin, Mode):
-    """Decision-rule-guided arg-max decoding with step-wise reasoning traces."""
+    """
+    Decision-rule-guided arg-max decoding with step-wise reasoning traces.
+    """
 
-    def __init__(
-        self,
-        model,
-        dataset,
-        decision_labeler: DecisionLabeler,
-        guidance_config: Optional[DecisionGuidanceConfig] = None,
-        decision_places_bundle_path: Optional[str] = None,
-        concept_name: str = "concept:name",
-        eos_value: str = "EOS",
-    ):
+    def __init__(self,
+                 model,
+                 dataset,
+                 decision_labeler: DecisionLabeler,
+                 guidance_config: Optional[DecisionGuidanceConfig] = None,
+                 decision_places_bundle_path: Optional[str] = None,
+                 concept_name: str = "concept:name",
+                 eos_value: str = "EOS"):
+        
         super().__init__(model=model, dataset=dataset, concept_name=concept_name, eos_value=eos_value)
         self._init_decision_guidance(
             decision_labeler=decision_labeler,
@@ -532,11 +496,7 @@ class GuidedMode(DecisionRuleGuidedMixin, Mode):
         )
 
     def decode_suffix(self, prefix, suffix, prefix_len, static_inputs=None, return_reasoning=False):
-        max_iteration = (
-            self.dataset.encoder_decoder.window_size
-            - self.dataset.encoder_decoder.min_suffix_size
-            - prefix_len
-        )
+        max_iteration = (self.dataset.encoder_decoder.window_size - self.dataset.encoder_decoder.min_suffix_size - prefix_len)
 
         self._reset_reasoning_state()
         current_prefix = ([t.clone() for t in prefix[0]], [t.clone() for t in prefix[1]])
@@ -565,21 +525,18 @@ class GuidedMode(DecisionRuleGuidedMixin, Mode):
 
             selected_activity = self._activity_label(activity_id)
             decoded.append(selected_activity)
-            self._append_reasoning_step(
-                step_idx=step_idx,
-                input_activity=input_activity,
-                selected_activity=selected_activity,
-                decision_context=decision_context,
-                past_events=past_events,
-                model_prob=float(masked_probs[activity_id].item()),
-            )
+            
+            self._append_reasoning_step(step_idx=step_idx,
+                                        input_activity=input_activity,
+                                        selected_activity=selected_activity,
+                                        decision_context=decision_context,
+                                        past_events=past_events,
+                                        model_prob=float(masked_probs[activity_id].item()))
 
-            current_prefix = self._roll_prefix_with_activity(
-                prefix=current_prefix,
-                suffix=suffix,
-                step_idx=step_idx,
-                activity_id=activity_id,
-            )
+            current_prefix = self._roll_prefix_with_activity(prefix=current_prefix,
+                                                             suffix=suffix,
+                                                             step_idx=step_idx,
+                                                             activity_id=activity_id)
 
             next_event_attrs = self._decode_event_attrs_from_prefix_last(current_prefix)
             next_event_attrs.update(self._extract_static_attrs(static_inputs))
@@ -604,13 +561,12 @@ class GuidedMode(DecisionRuleGuidedMixin, Mode):
                 target_suffix = self._decode_activity_suffix(suffix)
 
                 if return_reasoning:
-                    decoded, reasoning = self.decode_suffix(
-                        prefix=prefix,
-                        suffix=suffix,
-                        prefix_len=prefix_len,
-                        static_inputs=statics,
-                        return_reasoning=True,
-                    )
+                    decoded, reasoning = self.decode_suffix(prefix=prefix,
+                                                            suffix=suffix,
+                                                            prefix_len=prefix_len,
+                                                            static_inputs=statics,
+                                                            return_reasoning=True)
+                    
                     yield (case_name, prefix_len, prefix_activity, target_suffix, [decoded], reasoning)
                 else:
                     decoded = self.decode_suffix(prefix=prefix, suffix=suffix, prefix_len=prefix_len, static_inputs=statics)
@@ -618,37 +574,35 @@ class GuidedMode(DecisionRuleGuidedMixin, Mode):
 
 
 class GuidedMCSA(DecisionRuleGuidedMixin, MCSA):
-    """Decision-rule-guided Monte-Carlo suffix sampling."""
+    """
+    Decision-rule-guided Monte-Carlo suffix sampling.
+    """
 
-    def __init__(
-        self,
-        model,
-        dataset,
-        decision_labeler: DecisionLabeler,
-        guidance_config: Optional[DecisionGuidanceConfig] = None,
-        decision_places_bundle_path: Optional[str] = None,
-        concept_name: str = "concept:name",
-        eos_value: str = "EOS",
-        samples_per_case: int = 100,
-        sample_argmax: bool = False,
-        use_variance_cat: bool = True,
-        variational_dropout_sampling: bool = True,
-    ):
-        super().__init__(
-            model=model,
-            dataset=dataset,
-            concept_name=concept_name,
-            eos_value=eos_value,
-            samples_per_case=samples_per_case,
-            sample_argmax=sample_argmax,
-            use_variance_cat=use_variance_cat,
-            variational_dropout_sampling=variational_dropout_sampling,
-        )
-        self._init_decision_guidance(
-            decision_labeler=decision_labeler,
-            guidance_config=guidance_config,
-            decision_places_bundle_path=decision_places_bundle_path,
-        )
+    def __init__(self,
+                 model,
+                 dataset,
+                 decision_labeler: DecisionLabeler,
+                 guidance_config: Optional[DecisionGuidanceConfig] = None,
+                 decision_places_bundle_path: Optional[str] = None,
+                 concept_name: str = "concept:name",
+                 eos_value: str = "EOS",
+                 samples_per_case: int = 100,
+                 sample_argmax: bool = False,
+                 use_variance_cat: bool = True,
+                 variational_dropout_sampling: bool = True):
+        
+        super().__init__(model=model,
+                         dataset=dataset,
+                         concept_name=concept_name,
+                         eos_value=eos_value,
+                         samples_per_case=samples_per_case,
+                         sample_argmax=sample_argmax,
+                         use_variance_cat=use_variance_cat,
+                         variational_dropout_sampling=variational_dropout_sampling)
+        
+        self._init_decision_guidance(decision_labeler=decision_labeler,
+                                     guidance_config=guidance_config,
+                                     decision_places_bundle_path=decision_places_bundle_path)
 
     def sample_suffix(self,
                      prefix,
@@ -658,17 +612,11 @@ class GuidedMCSA(DecisionRuleGuidedMixin, MCSA):
                      suffix=None,
                      include_model_states=False,
                      return_reasoning=False):
-        prediction, (h, c), z = self.model.inference(
-            prefix=prefix,
-            static_inputs=static_inputs,
-            mask=mask,
-        )
+        
+        # call model:
+        prediction, (h, c), z = self.model.inference(prefix=prefix, static_inputs=static_inputs, mask=mask)
 
-        max_iteration = (
-            self.dataset.encoder_decoder.window_size
-            - self.dataset.encoder_decoder.min_suffix_size
-            - prefix_len
-        )
+        max_iteration = (self.dataset.encoder_decoder.window_size - self.dataset.encoder_decoder.min_suffix_size - prefix_len)
 
         self._reset_reasoning_state()
         sampled_suffix: List[str] = []
@@ -714,14 +662,12 @@ class GuidedMCSA(DecisionRuleGuidedMixin, MCSA):
             selected_activity = self._activity_label(sampled_activity_id)
             sampled_suffix.append(selected_activity)
 
-            self._append_reasoning_step(
-                step_idx=step_idx,
-                input_activity=input_activity,
-                selected_activity=selected_activity,
-                decision_context=decision_context,
-                past_events=past_events,
-                model_prob=float(masked_probs[sampled_activity_id].item()),
-            )
+            self._append_reasoning_step(step_idx=step_idx,
+                                        input_activity=input_activity,
+                                        selected_activity=selected_activity,
+                                        decision_context=decision_context,
+                                        past_events=past_events,
+                                        model_prob=float(masked_probs[sampled_activity_id].item()))
 
             cat_predictions = self._sample_categorical_predictions(cat_means, cat_vars)
             cat_predictions[activity_key] = torch.tensor([[sampled_activity_id]], device=activity_logits.device, dtype=torch.long)
@@ -730,12 +676,10 @@ class GuidedMCSA(DecisionRuleGuidedMixin, MCSA):
                 model_states.append((h, c))
 
             if suffix is not None:
-                next_event_attrs = self._decode_event_attrs_from_suffix_step(
-                    suffix=suffix,
-                    step_idx=step_idx,
-                    activity_id=sampled_activity_id,
-                    static_inputs=static_inputs,
-                )
+                next_event_attrs = self._decode_event_attrs_from_suffix_step(suffix=suffix,
+                                                                             step_idx=step_idx,
+                                                                             activity_id=sampled_activity_id,
+                                                                             static_inputs=static_inputs)
             else:
                 predicted_ids: Dict[str, int] = {}
                 for key, value in cat_predictions.items():
@@ -771,14 +715,13 @@ class GuidedMCSA(DecisionRuleGuidedMixin, MCSA):
         suffixes = []
         for _ in range(self.samples_per_case):
             suffixes.append(
-                self.sample_suffix(
-                    prefix=prefix,
-                    prefix_len=prefix_len,
-                    static_inputs=static_inputs,
-                    mask=mask,
-                    suffix=suffix,
-                    include_model_states=include_model_states)
-            )
+                self.sample_suffix(prefix=prefix,
+                                   prefix_len=prefix_len,
+                                   static_inputs=static_inputs,
+                                   mask=mask,
+                                   suffix=suffix,
+                                   include_model_states=include_model_states))
+            
         return suffixes
 
     def evaluate(self, random_order=False, include_model_states=False, return_reasoning=False):
@@ -795,29 +738,26 @@ class GuidedMCSA(DecisionRuleGuidedMixin, MCSA):
                 target_suffix = self._decode_activity_suffix(suffix)
 
                 if not return_reasoning:
-                    sampled_suffixes = self.predict_probabilistic_suffix(
-                        prefix=prefix,
-                        prefix_len=prefix_len,
-                        static_inputs=statics,
-                        mask=zero_mask,
-                        suffix=suffix,
-                        include_model_states=include_model_states,
-                    )
+                    sampled_suffixes = self.predict_probabilistic_suffix(prefix=prefix,
+                                                                         prefix_len=prefix_len,
+                                                                         static_inputs=statics,
+                                                                         mask=zero_mask,
+                                                                         suffix=suffix,
+                                                                         include_model_states=include_model_states)
                     yield (case_name, prefix_len, prefix_activity, target_suffix, sampled_suffixes)
                     continue
 
                 sampled_suffixes: List[List[str]] = []
                 reasonings: List[Dict[str, Any]] = []
                 for _ in range(self.samples_per_case):
-                    sampled, reasoning = self.sample_suffix(
-                        prefix=prefix,
-                        prefix_len=prefix_len,
-                        static_inputs=statics,
-                        mask=zero_mask,
-                        suffix=suffix,
-                        include_model_states=False,
-                        return_reasoning=True,
-                    )
+                    sampled, reasoning = self.sample_suffix(prefix=prefix,
+                                                            prefix_len=prefix_len,
+                                                            static_inputs=statics,
+                                                            mask=zero_mask,
+                                                            suffix=suffix,
+                                                            include_model_states=False,
+                                                            return_reasoning=True
+                                                            )
                     sampled_suffixes.append(sampled)
                     reasonings.append(reasoning)
 
@@ -825,31 +765,24 @@ class GuidedMCSA(DecisionRuleGuidedMixin, MCSA):
 
 
 class GuidedBeam(DecisionRuleGuidedMixin, Beam):
-    """Decision-rule-guided beam search with beam-local decision contexts."""
-
-    def __init__(
-        self,
-        model,
-        dataset,
-        decision_labeler: DecisionLabeler,
-        guidance_config: Optional[DecisionGuidanceConfig] = None,
-        decision_places_bundle_path: Optional[str] = None,
-        concept_name: str = "concept:name",
-        eos_value: str = "EOS",
-        beam_width: int = 3,
-    ):
-        super().__init__(
-            model=model,
-            dataset=dataset,
-            concept_name=concept_name,
-            eos_value=eos_value,
-            beam_width=beam_width,
-        )
-        self._init_decision_guidance(
-            decision_labeler=decision_labeler,
-            guidance_config=guidance_config,
-            decision_places_bundle_path=decision_places_bundle_path,
-        )
+    """
+    Decision-rule-guided beam search with beam-local decision contexts.
+    Taymouri GAN LSTM
+    """
+    def __init__(self,
+                 model,
+                 dataset,
+                 decision_labeler: DecisionLabeler,
+                 guidance_config: Optional[DecisionGuidanceConfig] = None,
+                 decision_places_bundle_path: Optional[str] = None,
+                 concept_name: str = "concept:name",
+                 eos_value: str = "EOS",
+                 beam_width: int = 3):
+        
+        super().__init__(model=model, dataset=dataset, concept_name=concept_name, eos_value=eos_value, beam_width=beam_width)
+        self._init_decision_guidance(decision_labeler=decision_labeler,
+                                     guidance_config=guidance_config,
+                                     decision_places_bundle_path=decision_places_bundle_path)
 
     def _next_activity_probs_from_prefix(self, prefix) -> torch.Tensor:
         model_prefix = self._project_prefix_for_model(prefix)
@@ -861,27 +794,19 @@ class GuidedBeam(DecisionRuleGuidedMixin, Beam):
         return F.softmax(logits, dim=-1)
 
     def decode_suffix(self, prefix, suffix, prefix_len, static_inputs=None, return_reasoning=False):
-        max_iteration = (
-            self.dataset.encoder_decoder.window_size
-            - self.dataset.encoder_decoder.min_suffix_size
-            - prefix_len
-        )
+        max_iteration = (self.dataset.encoder_decoder.window_size - self.dataset.encoder_decoder.min_suffix_size - prefix_len)
 
         static_attrs = self._extract_static_attrs(static_inputs)
         initial_events = self._build_initial_past_events(prefix, static_inputs)
 
-        beams: List[Dict[str, Any]] = [
-            {
-                "prefix": ([t.clone() for t in prefix[0]], [t.clone() for t in prefix[1]]),
-                "seq": [],
-                "score": 0.0,
-                "past_events": [dict(ev) for ev in initial_events],
-                "reasoning": [],
-                "conflicts": 0,
-                "decision_steps": 0,
-                "done": False,
-            }
-        ]
+        beams: List[Dict[str, Any]] = [{"prefix": ([t.clone() for t in prefix[0]], [t.clone() for t in prefix[1]]),
+                                        "seq": [],
+                                        "score": 0.0,
+                                        "past_events": [dict(ev) for ev in initial_events],
+                                        "reasoning": [],
+                                        "conflicts": 0,
+                                        "decision_steps": 0,
+                                        "done": False}]
 
         for step_idx in range(max_iteration + 1):
             candidates: List[Dict[str, Any]] = []
@@ -942,30 +867,25 @@ class GuidedBeam(DecisionRuleGuidedMixin, Beam):
                                     explained = True
                                     explanation_status = "explained"
 
-                            new_reasoning.append(
-                                {
-                                    "step": int(step_idx),
-                                    "place": place_name,
-                                    "input_event": str(input_activity),
-                                    "next_event": str(selected_activity),
-                                    "confidence": float(c_i),
-                                    "decision_top_event": top_decision_event,
-                                    "decision_top_prob": top_decision_prob,
-                                    "supported_set": [str(a) for a in supported],
-                                    "conflict": bool(conflict),
-                                    "explained": bool(explained),
-                                    "explanation_status": str(explanation_status),
-                                    "decision_distribution": {k: float(v) for k, v in z_i.items()},
-                                    "attribute_checks": attribute_checks,
-                                    "matched_rule": None if guard is None else {
-                                        "rule": guard.get("rule", ""),
-                                        "raw_rule": guard.get("raw_rule", ""),
-                                        "prob_model": float(guard.get("prob_model", 0.0)),
-                                        "support": int(guard.get("support", 0)),
-                                        "score": float(guard.get("score", 0.0)),
-                                    },
-                                }
-                            )
+                            new_reasoning.append({"step": int(step_idx),
+                                                  "place": place_name,
+                                                  "input_event": str(input_activity),
+                                                  "next_event": str(selected_activity),
+                                                  "confidence": float(c_i),
+                                                  "decision_top_event": top_decision_event,
+                                                  "decision_top_prob": top_decision_prob,
+                                                  "supported_set": [str(a) for a in supported],
+                                                  "conflict": bool(conflict),
+                                                  "explained": bool(explained),
+                                                  "explanation_status": str(explanation_status),
+                                                  "decision_distribution": {k: float(v) for k, v in z_i.items()},
+                                                  "attribute_checks": attribute_checks,
+                                                  "matched_rule": None if guard is None else {"rule": guard.get("rule", ""),
+                                                                                              "raw_rule": guard.get("raw_rule", ""),
+                                                                                              "prob_model": float(guard.get("prob_model", 0.0)),
+                                                                                              "support": int(guard.get("support", 0)),
+                                                                                              "score": float(guard.get("score", 0.0))},
+                                                  })
 
                         new_prefix = self._roll_prefix_with_activity_from_suffix(
                             prefix=beam["prefix"],
@@ -978,18 +898,15 @@ class GuidedBeam(DecisionRuleGuidedMixin, Beam):
                         next_attrs = self.decision_labeler._filter_attributes(next_attrs)
                         new_past_events.append(next_attrs)
 
-                    candidates.append(
-                        {
-                            "prefix": new_prefix,
-                            "seq": new_seq,
-                            "score": float(beam["score"] + tok_logp),
-                            "past_events": new_past_events,
-                            "reasoning": new_reasoning,
-                            "conflicts": new_conflicts,
-                            "decision_steps": new_decision_steps,
-                            "done": done,
-                        }
-                    )
+                    candidates.append({"prefix": new_prefix,
+                                       "seq": new_seq,
+                                       "score": float(beam["score"] + tok_logp),
+                                       "past_events": new_past_events,
+                                       "reasoning": new_reasoning,
+                                       "conflicts": new_conflicts,
+                                       "decision_steps": new_decision_steps,
+                                       "done": done
+                                       })
 
             candidates.sort(key=lambda b: b["score"], reverse=True)
             beams = candidates[: self.beam_width]
@@ -1014,17 +931,15 @@ class GuidedBeam(DecisionRuleGuidedMixin, Beam):
             explained_rate = 0.0
             if b["decision_steps"] > 0:
                 explained_rate = float(explained_steps) / float(b["decision_steps"])
-            reasoning_beams.append(
-                {
-                    "decision_steps": int(b["decision_steps"]),
-                    "conflicts": int(b["conflicts"]),
-                    "conflict_rate": float(rate),
-                    "explained_steps": int(explained_steps),
-                    "explained_rate": float(explained_rate),
-                    "trace": b["reasoning"],
-                    "beam_logprob": float(b["score"]),
-                }
-            )
+            
+            reasoning_beams.append({"decision_steps": int(b["decision_steps"]),
+                                    "conflicts": int(b["conflicts"]),
+                                    "conflict_rate": float(rate),
+                                    "explained_steps": int(explained_steps),
+                                    "explained_rate": float(explained_rate),
+                                    "trace": b["reasoning"],
+                                    "beam_logprob": float(b["score"])
+                                    })
 
         if return_reasoning:
             return decoded_beams, reasoning_beams
@@ -1043,19 +958,20 @@ class GuidedBeam(DecisionRuleGuidedMixin, Beam):
                 prefix_activity = self._decode_activity_prefix(prefix)
                 target_suffix = self._decode_activity_suffix(suffix)
                 if return_reasoning:
-                    decoded_suffixes, reasonings = self.decode_suffix(
-                        prefix=prefix,
-                        suffix=suffix,
-                        prefix_len=prefix_len,
-                        static_inputs=statics,
-                        return_reasoning=True,
-                    )
+                    
+                    decoded_suffixes, reasonings = self.decode_suffix(prefix=prefix,
+                                                                      suffix=suffix,
+                                                                      prefix_len=prefix_len,
+                                                                      static_inputs=statics,
+                                                                      return_reasoning=True)
+                    
                     yield (case_name, prefix_len, prefix_activity, target_suffix, decoded_suffixes, reasonings)
                 else:
                     decoded_suffixes = self.decode_suffix(prefix=prefix, suffix=suffix, prefix_len=prefix_len, static_inputs=statics)
                     yield (case_name, prefix_len, prefix_activity, target_suffix, decoded_suffixes)
 
 
+# call the right mode method:
 def get_decision_guided_evaluator(kind: str,
                                   model,
                                   dataset,
@@ -1072,13 +988,11 @@ def get_decision_guided_evaluator(kind: str,
     """
     kind_normalized = kind.strip().lower()
 
-    common_kwargs = {
-        "model": model,
-        "dataset": dataset,
-        "decision_labeler": decision_labeler,
-        "guidance_config": guidance_config,
-        "decision_places_bundle_path": decision_places_bundle_path,
-    }
+    common_kwargs = {"model": model,
+                     "dataset": dataset,
+                     "decision_labeler": decision_labeler,
+                     "guidance_config": guidance_config,
+                     "decision_places_bundle_path": decision_places_bundle_path}
     common_kwargs.update(kwargs)
 
     if kind_normalized == "mcsa":

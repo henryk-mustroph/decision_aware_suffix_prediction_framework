@@ -5,9 +5,11 @@
 This project uses `pipenv` for managing Python dependencies. Follow the steps below to set up the virtual environment and install the necessary packages using the provided `Pipfile`.
 
 ### Prerequisites
-Make sure you have Python and Pipenv installed.
+Make sure you have **Python 3.12** and **Pipenv** installed. The `Pipfile` and `Pipfile.lock` require Python 3.12.
 
 ### Setup Instructions
+
+Run the following commands from the **project root** (where the `Pipfile` is located):
 
 1. **Create the Virtual Environment**:
     
