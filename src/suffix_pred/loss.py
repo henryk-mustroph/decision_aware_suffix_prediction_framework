@@ -1,7 +1,7 @@
 """
 Loss functions for categorical event label sequence training.
 
-Includes standard and uncertainty-attenuated cross entropy variants, and a decision-aware guard cross-entropy for regularization.
+Includes standard and uncertainty-attenuated cross entropy variants, and a decision-aware semantic loss (set-membership constraint over the support of a decision-model distribution).
 """
 
 # performance imports for torch: torch kernel uses one core only.
@@ -17,22 +17,16 @@ class Loss:
         pass
     
     def _reduce_loss(self, loss_matrix, eos_paddings):
-        # normal loss reduction
         if eos_paddings is None:
             return torch.mean(loss_matrix)
-        
-        # eos padd masking loss reduction
-        else:
-            if loss_matrix.shape == eos_paddings.shape:
-                # Mask the loss matrix: Use torch.where to avoid NaN propagation from padded regions
-                L = torch.where(eos_paddings.bool(), loss_matrix, torch.tensor(0.0, device=loss_matrix.device))
-            
-                # Normalize loss per active timestep
-                total_valid_tokens = torch.sum(eos_paddings)
-                # Sum loss over all tokens and divide by total count
-                return torch.sum(L) / (total_valid_tokens + 1e-8)
-            else:
-                return ValueError("loss and eos paddings have wrong shape!")
+
+        if loss_matrix.shape != eos_paddings.shape:
+            raise ValueError("loss and eos paddings have wrong shape!")
+
+        # Use torch.where to avoid NaN propagation from padded regions.
+        L = torch.where(eos_paddings.bool(), loss_matrix, torch.tensor(0.0, device=loss_matrix.device))
+        total_valid_tokens = torch.sum(eos_paddings)
+        return torch.sum(L) / (total_valid_tokens + 1e-8)
     
     def standard_cross_entropy(self, pred_logits, targets, eos_paddings):
         """
@@ -102,76 +96,132 @@ class Loss:
           
         return L
 
-    # correcte
-    def guard_KL_loss(self, 
+    def gaussian_nll_loss(self,
+                          pred_means,
+                          pred_logvars,
+                          targets,
+                          eos_paddings):
+        """
+        Gaussian negative log-likelihood loss for autoregressive numerical event attribute prediction.
+
+        Inputs:
+        - pred_means: predicted means: dim: seq_len x batch x 1
+        - pred_logvars: predicted log-variances: dim: seq_len x batch x 1
+        - targets: target scalar values: dim: batch x seq_len
+        - eos_paddings: Optional EOS mask (batch x seq_len).
+
+        Outputs:
+        - L: Scalar loss value.
+        """
+        # Numerical heads output [seq_len, batch, 1] -> squeeze last dim.
+        if pred_means.dim() == 3 and pred_means.shape[-1] == 1:
+            pred_means = pred_means.squeeze(-1)
+        if pred_logvars.dim() == 3 and pred_logvars.shape[-1] == 1:
+            pred_logvars = pred_logvars.squeeze(-1)
+
+        # Align prediction shape [seq_len, batch] with targets [batch, seq_len].
+        pred_means = pred_means.permute(1, 0)
+        pred_logvars = pred_logvars.permute(1, 0)
+
+        # Clamp log-variance for numerical stability.
+        pred_logvars = torch.clamp(pred_logvars, min=-6.0, max=6.0)
+        precision = torch.exp(-pred_logvars)
+
+        # Per-step Gaussian NLL (ignoring constant log(2*pi) term).
+        per_step_loss = 0.5 * (precision * (targets - pred_means) ** 2 + pred_logvars)
+
+        return self._reduce_loss(per_step_loss, eos_paddings)
+
+    def semantic_loss(self,
                       pred_logits,
                       guard_targets,
                       guard_mask,
+                      tau,
                       eos_paddings=None,
-                      next_event_targets=None,
-                      guard_confidence=None,
                       teacher_forcing_mask=None,
-                      support_threshold=0.0):
+                      gt_targets=None,
+                      gt_in_support_only=False):
         """
-        Decision-aware guard KL loss (L_guard).
-        Computes a weighted KL divergence between the thresholded and renormalized decision-model distribution q and the predicted next-event-label distribution.
+        Decision-aware semantic loss (L_sem).
+        Hard set-membership constraint at each decision-labeled event: the
+        predictor must place sufficient probability mass on the tau-support
+        of the decision-model distribution:
+            S^(i)_{k+s} := { a in A | z^(i)_{k+s}(a) >= tau }.
+
+        Per-step loss:
+            l_sem(i, s) = 1[p != bot] * 1[S != empty]
+                          * ( - log sum_{a in S} p_theta(a) )
+
+        Aggregated over a mini-batch:
+            L_sem = (1 / N_B) * sum_{i in B} sum_{s=0}^{S^(i)-1} l_sem(i, s)
+        where N_B is the count of decoder steps satisfying both indicators.
 
         Inputs:
-        - pred_logits: Predicted logit values: dim: seq_len x batch x classes
-        - guard_targets: Soft target distributions from the decision model: dim: batch x seq_len x classes.  z_i(a) for each event and label.
-        - guard_mask: Binary indicator for decision-labeled events: dim: batch x seq_len.  1 where z_i != bot, 0 otherwise.
+        - pred_logits: Predicted next-event logits: dim seq_len x batch x classes.
+        - guard_targets: Soft decision-model distributions z_i: dim batch x seq_len x classes.
+        - guard_mask: Indicator 1[p_i != bot]: dim batch x seq_len.
+        - tau: Decision-support threshold in (0, 1].
         - eos_paddings: Optional EOS mask (batch x seq_len).
-        - next_event_targets: Ground-truth next-event labels (batch x seq_len). Used to compute correctness weights w = z(a*).
-        - guard_confidence: Optional confidence c_i with dim (batch x seq_len).
-        - support_threshold: Decision-support threshold tau.
+        - teacher_forcing_mask: Optional mask restricting the loss to decoder steps that consumed a ground-truth previous event. Required because the offline labeling assumption only assigns decision labels to ground-truth events.
+        - gt_targets: Optional ground-truth next-activity ids: dim batch x seq_len.
+          Only consulted when ``gt_in_support_only`` is True.
+        - gt_in_support_only: When True (and ``gt_targets`` is given), additionally
+          restrict the loss to steps whose ground-truth next activity is itself in
+          the tau-support, i.e. steps where the (learned, imperfect) decision model
+          AGREES with the observed outcome. The semantic-loss formulation of
+          Xu et al. (2018) assumes *exact* logical constraints that the true label
+          always satisfies; a mined decision model is a *soft, noisy* constraint
+          whose tau-support excludes the realised next activity on a large fraction
+          of events (≈56% on Helpdesk). On those steps the unfiltered loss pulls
+          probability mass away from the ground truth and fights the base
+          cross-entropy, degrading suffix accuracy (DLS) while barely moving
+          decision conformance. This gate keeps the symbolic signal only where the
+          constraint is consistent with reality, which removes that label noise.
+          It uses the ground-truth label, so it is a *training-time* denoising
+          step only; inference-time decoding / conformance never see it (no leak).
 
         Outputs:
-        - L_guard: Scalar guard loss, averaged over effective weight sum. Returns 0 (with grad) if no regularized steps exist.
+        - L_sem: Scalar semantic loss averaged over N_B. Returns 0 (with grad) when no eligible step exists.
         """
-        # no soft next-event labels given:
         if guard_targets is None or guard_targets.shape[-1] == 0:
             return pred_logits.sum() * 0.0
 
         # log p_theta(a): [S, B, C] -> [B, S, C]
         log_probs = F.log_softmax(pred_logits, dim=-1).permute(1, 0, 2)
 
-        # Build support set S := {a | z(a) >= tau}, then renormalize to q.
+        # tau-support: S = { a | z(a) >= tau }
         z = guard_targets.clamp_min(0.0)
-        support = (z >= support_threshold).to(z.dtype)
-        q_num = z * support
-        q_den = q_num.sum(dim=-1, keepdim=True)
-        valid_support = (q_den.squeeze(-1) > 0).to(z.dtype)
-        q = q_num / q_den.clamp(min=1e-8)
+        support = (z >= tau).to(log_probs.dtype)
 
-        # KL(q || p) = sum_a q(a) * (log q(a) - log p(a))
-        per_step_kl = (q * (torch.log(q.clamp(min=1e-8)) - log_probs)).sum(dim=-1)
+        # 1[S != empty]
+        nonempty_support = (support.sum(dim=-1) > 0).to(log_probs.dtype)
 
-        # Base weight: decision-labeled positions and non-empty support.
-        weight = guard_mask * valid_support
+        # log( sum_{a in S} p_theta(a) ) via masked logsumexp.
+        # A large negative log-mask zeroes contributions outside the support.
+        log_mask = torch.where(support > 0,
+                               torch.zeros_like(support),
+                               torch.full_like(support, -1e30))
+        log_mass = torch.logsumexp(log_probs + log_mask, dim=-1)  # [B, S]
 
-        # Correctness weight w = z(a*), where a* is the ground-truth next label.
-        if next_event_targets is not None:
-            a_star = next_event_targets.long().unsqueeze(-1)
-            support_star = torch.gather(support, dim=-1, index=a_star).squeeze(-1)
-            w = torch.gather(z, dim=-1, index=a_star).squeeze(-1) * support_star
-            weight = weight * w
+        # Combine the two per-step indicators.
+        indicator = guard_mask * nonempty_support
 
-        # Confidence weight c_i (defaults to 1 when not provided).
-        if guard_confidence is not None:
-            weight = weight * guard_confidence
-
-        # Optional EOS masking.
         if eos_paddings is not None:
-            weight = weight * eos_paddings
+            indicator = indicator * eos_paddings
 
-        # Optional teacher-forcing masking: regularize only decoder steps
-        # that consumed ground-truth next-event inputs.
+        # Decision labels are only valid for ground-truth events along the
+        # trace; restrict the loss to teacher-forced decoder steps.
         if teacher_forcing_mask is not None:
-            weight = weight * teacher_forcing_mask
+            indicator = indicator * teacher_forcing_mask
 
-        weighted = per_step_kl * weight
+        # Decision-label denoising: keep only steps where the decision model's
+        # tau-support contains the true next activity (see docstring).
+        if gt_in_support_only and gt_targets is not None:
+            gt_idx = gt_targets.long().unsqueeze(-1).clamp(min=0, max=support.shape[-1] - 1)
+            gt_in_support = torch.gather(support, dim=-1, index=gt_idx).squeeze(-1)  # [B, S]
+            indicator = indicator * gt_in_support
 
-        # Normalize by effective batch weight sum.
-        W = weight.sum().clamp(min=1e-8)
-        
-        return weighted.sum() / W
+        per_step_loss = -log_mass * indicator
+        N_B = indicator.sum().clamp(min=1e-8)
+
+        return per_step_loss.sum() / N_B

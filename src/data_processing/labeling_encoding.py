@@ -87,7 +87,6 @@ class RawDataFrameLoader:
         case_name: str,
         categorical_columns: list[str],
         continuous_columns: list[str],
-        continuous_positive_columns: list[str],
         static_categorical_columns: Optional[list[str]] = None,
         static_continuous_columns: Optional[list[str]] = None,
         time_since_case_start_column: str | None = None,
@@ -117,8 +116,6 @@ class RawDataFrameLoader:
         # dynamic attributes
         self.categorical_columns = list(categorical_columns or [])
         self.continuous_columns = list(continuous_columns or [])
-        # dynamic (log-normal) continuous attributes
-        self.continuous_positive_columns = list(continuous_positive_columns or [])
         # static attributes
         self.static_categorical_columns = list(static_categorical_columns or [])
         self.static_continuous_columns = list(static_continuous_columns or [])
@@ -152,7 +149,6 @@ class RawDataFrameLoader:
             for col in (
                 self.categorical_columns
                 + self.continuous_columns
-                + self.continuous_positive_columns
             ):
                 if col in group.columns:
                     row[col] = group[col].tolist()
@@ -216,8 +212,6 @@ class CSV2EventLog(RawDataFrameLoader):
                 )
 
         for continuous_col in self.continuous_columns:
-            self.df[continuous_col] = self.df[continuous_col].astype("float32")
-        for continuous_col in self.continuous_positive_columns:
             self.df[continuous_col] = self.df[continuous_col].astype("float32")
 
     def __create_time_since_case_start_column(self):
@@ -394,50 +388,6 @@ class EventLogSplitter:
         return train_df, train_validation_df, test_validation_df
 
 
-class PositiveStandardizer_normed(BaseEstimator, TransformerMixin):
-    """
-    Standard scaler for log normal attributes.
-    """
-
-    def __init__(self):
-        """
-        Initialize the standardizer.
-        """
-        self.mean_ = None
-        self.std_ = None
-
-    def fit(self, X, y=None):
-        """
-        Fit the standardizer by computing mean and std of log-transformed data.
-        """
-        print("Positive Standardization")
-        log_x = np.log1p(X)
-        print("min,25%,50%,75%,max:", np.percentile(log_x, [0, 25, 50, 75, 100]))
-        # Standardize values
-        self.mean_ = np.mean(log_x, axis=0)
-        print("Mean: ", self.mean_)
-        self.std_ = np.std(log_x, axis=0)
-        print("Std: ", self.std_)
-        return self
-
-    def transform(self, X):
-        """
-        Transform the data by applying log transformation and standardization.
-        """
-        # log the observations to assume normal PDF
-        log_x = np.log1p(X)
-        x_enc = (log_x - self.mean_) / self.std_
-        return x_enc
-
-    def inverse_transform(self, X_enc):
-        """
-        Inverse transform the encoded data back to the original scale.
-        """
-        # Destandardization
-        log_x = X_enc * self.std_ + self.mean_
-        # Exponentiation:
-        x = np.expm1(log_x)
-        return x
 
 
 class TensorEncoderDecoder:
@@ -454,7 +404,6 @@ class TensorEncoderDecoder:
         min_suffix_size: int,
         categorical_columns: Optional[list[str]] = None,
         continuous_columns: Optional[list[str]] = None,
-        continuous_positive_columns: Optional[list[str]] = None,
         static_categorical_columns: Optional[list[str]] = None,
         static_continuous_columns: Optional[list[str]] = None,
         **kwargs,
@@ -478,7 +427,6 @@ class TensorEncoderDecoder:
             self.window_size = window_size
         self.categorical_columns = list(categorical_columns or [])
         self.continuous_columns = list(continuous_columns or [])
-        self.continuous_positive_columns = list(continuous_positive_columns or [])
         self.static_categorical_columns = list(static_categorical_columns or [])
         self.static_continuous_columns = list(static_continuous_columns or [])
 
@@ -507,13 +455,6 @@ class TensorEncoderDecoder:
                     self.__get_continuous_encoder()
                 )
 
-        for continuous_positive_column in self.continuous_positive_columns:
-            self.continuous_imputers[continuous_positive_column] = (
-                self.__get_continuous_positive_imputer()
-            )
-            self.continuous_encoders[continuous_positive_column] = (
-                self.__get_continuous_positive_encoder()
-            )
 
     def train_imputers_encoders(self):
         """
@@ -585,7 +526,7 @@ class TensorEncoderDecoder:
         for col in self.categorical_columns:
             if col not in df_case:
                 df_case[col] = np.nan
-        for col in self.continuous_columns + self.continuous_positive_columns:
+        for col in self.continuous_columns:
             if col not in df_case:
                 df_case[col] = np.nan
 
@@ -594,7 +535,7 @@ class TensorEncoderDecoder:
         for col in self.categorical_columns:
             cat_columns = self._single_encode_categorical_column(df_case, col)
             categorical_tensors.append(cat_columns)
-        for col in self.continuous_columns + self.continuous_positive_columns:
+        for col in self.continuous_columns:
             cont_columns = self._single_encode_continuous_column(df_case, col)
             continuous_tensors.append(cont_columns)
 
@@ -668,7 +609,7 @@ class TensorEncoderDecoder:
 
         continuous_tensors = []
         for col in tqdm(
-            self.continuous_columns + self.continuous_positive_columns,
+            self.continuous_columns,
             desc="continouous tensors",
         ):
             continuous_tensors.append(self.encode_continuous_column(df, col))
@@ -941,7 +882,7 @@ class TensorEncoderDecoder:
                 dec_col = enc_col
             decoded_event[col] = dec_col.tolist()
         for i, col in enumerate(
-            self.continuous_columns + self.continuous_positive_columns
+            self.continuous_columns
         ):
             enc_col = cont[i].unsqueeze(-1).numpy()
             if col in self.continuous_encoders:
@@ -976,18 +917,7 @@ class TensorEncoderDecoder:
         """
         return sklearn.preprocessing.StandardScaler()
 
-    def __get_continuous_positive_imputer(self):
-        """
-        Get the imputer for continuous positive variables.
-        """
-        return SimpleImputer(strategy="mean")
 
-    def __get_continuous_positive_encoder(self):
-        """
-        Get the encoder for continuous positive variables.
-        """
-        standardizer = PositiveStandardizer_normed()
-        return standardizer
 
 
 class PrefixesDataFrameLoader:
@@ -1012,9 +942,6 @@ class PrefixesDataFrameLoader:
         )
         self.continuous_columns = list(
             event_log_properties.get("continuous_columns") or []
-        )
-        self.continuous_positive_columns = list(
-            event_log_properties.get("continuous_positive_columns") or []
         )
 
         self.static_categorical_columns = list(
@@ -1118,7 +1045,7 @@ class PrefixesDataFrameLoader:
                     row[col] = self._limit_sequence(values)
 
                 # continuous
-                for col in self.continuous_columns + self.continuous_positive_columns:
+                for col in self.continuous_columns:
                     values = (
                         group[col].iloc[:prefix_len].tolist()
                         if col in group.columns
@@ -1185,7 +1112,7 @@ class PrefixesDataFrameLoader:
         # Get min/max ranges for each continuous column
         continuous_columns = self.event_log_properties.get(
             "continuous_columns", []
-        ) + self.event_log_properties.get("continuous_positive_columns", [])
+        )
         for col in continuous_columns:
             if col in self.event_log.columns:
                 # Get non-null values
@@ -1250,9 +1177,8 @@ class EventLogDataset(Dataset):
         )
 
         # Dense guard tensors (populated by prepare_guard_tensors)
-        self._guard_targets: Optional[torch.Tensor] = None     # [N, T, C]
-        self._guard_mask: Optional[torch.Tensor] = None         # [N, T]
-        self._guard_confidence: Optional[torch.Tensor] = None  # [N, T]
+        self._guard_targets: Optional[torch.Tensor] = None  # [N, T, C]
+        self._guard_mask: Optional[torch.Tensor] = None     # [N, T]
 
     @staticmethod
     def _prefix_length_from_zero_mask(zero_mask: torch.Tensor) -> int:
@@ -1286,23 +1212,26 @@ class EventLogDataset(Dataset):
         return torch.empty((self.zero_padding.shape[0], 0), dtype=torch.float32)
 
 
-    #
-    #
-    # New: transform (p,A,z,c) to tensors required for training
-    #
-    #
     def prepare_guard_tensors(self, concept_name_feature_idx: int) -> None:
         """
-        Convert sparse decision_data to dense guard tensors for training.
-        Must be called after set_decision_data.  
-        
+        Convert the sparse ``decision_data`` (list of ``(p_i, z_i)`` per
+        active event) into dense guard tensors that are stored on the
+        dataset and consumed by the decision-aware loss.
+
+        Must be called after :meth:`set_decision_data`.
+
         Creates:
-        _guard_targets: [N, T, num_classes]: soft z_i distributions: for each trace, a list with size (padded) as the inputs, for each value a list with probs for next event label of vocabulary A
-        _guard_mask: [N, T]: 1 at decision-labeled positions: for each trace, a list with size (padded) as the inputs, with one is the event is decision event
-        _guard_confidence [N, T]: c_i = max(z_i) at decision positions: for each trace, a list with size (padded) as the inputs, the prob of arg-max over next event label classes.
+        - ``_guard_targets`` [N, T, num_classes]
+              Soft next-activity distributions z_i, right-aligned within the
+              padded length T. Rows where p_i = BOTTOM stay all-zero.
+        - ``_guard_mask`` [N, T]
+              1.0 at positions whose event has a decision label, 0.0 otherwise.
+              The loss only regularizes positions where the mask is 1.
 
         Args:
-        - concept_name_feature_idx: index of the concept:name feature inside all_categories[0].
+        - concept_name_feature_idx: index of the concept:name feature inside
+          all_categories[0]; used to map z_i's activity labels back to the
+          model's vocabulary indices.
         """
         if isinstance(self.decision_data, torch.Tensor):
             return  # decision data not set yet
@@ -1315,24 +1244,17 @@ class EventLogDataset(Dataset):
 
         guard_targets = torch.zeros(N, T, num_classes, dtype=torch.float32)
         guard_mask = torch.zeros(N, T, dtype=torch.float32)
-        guard_confidence = torch.zeros(N, T, dtype=torch.float32)
 
         for i in range(N):
             dd = self.decision_data[i]
             if not isinstance(dd, list) or len(dd) == 0:
                 continue
             P = len(dd)
-            offset = T - P  # zero-padding offset: right-aligns P labels into T slots
-            for j, entry in enumerate(dd):
-                place_name, dist, *rest = entry
-                # 3rd element (index 0 of rest) is c_i when present
-                c_i = float(rest[0]) if len(rest) >= 1 else (
-                    max(dist.values()) if dist else 0.0
-                )
+            offset = T - P  # right-align P labels into T slots (matches zero-padding on the left)
+            for j, (place_name, dist) in enumerate(dd):
                 if place_name == "\u22a5" or not dist:
                     continue
                 guard_mask[i, offset + j] = 1.0
-                guard_confidence[i, offset + j] = c_i
                 for label, prob in dist.items():
                     idx = label_to_idx.get(label)
                     if idx is not None:
@@ -1340,7 +1262,6 @@ class EventLogDataset(Dataset):
 
         self._guard_targets = guard_targets
         self._guard_mask = guard_mask
-        self._guard_confidence = guard_confidence
 
     def __len__(self):
         """
@@ -1364,16 +1285,10 @@ class EventLogDataset(Dataset):
         static_cont = self.static_continuous_tensor[idx]
 
         if self._guard_targets is not None:
-            guard_item = (
-                self._guard_targets[idx],
-                self._guard_mask[idx],
-                self._guard_confidence[idx] if self._guard_confidence is not None
-                else torch.zeros(self.zero_padding.shape[1], dtype=torch.float32),
-            )
+            guard_item = (self._guard_targets[idx], self._guard_mask[idx])
         else:
             guard_item = (
                 torch.zeros(self.zero_padding.shape[1], 0, dtype=torch.float32),
-                torch.zeros(self.zero_padding.shape[1], dtype=torch.float32),
                 torch.zeros(self.zero_padding.shape[1], dtype=torch.float32),
             )
 
@@ -1420,15 +1335,18 @@ class EventLogDataset(Dataset):
         if self._guard_targets is not None:
             new_ds._guard_targets = self._guard_targets.index_select(0, idx_tensor)
             new_ds._guard_mask = self._guard_mask.index_select(0, idx_tensor)
-            if self._guard_confidence is not None:
-                new_ds._guard_confidence = self._guard_confidence.index_select(0, idx_tensor)
         return new_ds
 
     def set_decision_data(
         self, decision_data, indices: Optional[Iterable[int]] = None
     ) -> None:
         """
-        Set decision data for dataset prefixes.
+        Set decision-aware event labels for the dataset.
+
+        Each row must contain one ``(p_i, z_i)`` tuple per active event of
+        the sample, where ``p_i`` is the decision place name (or the
+        BOTTOM sentinel) and ``z_i`` is a ``{activity_label: probability}``
+        dict (empty for BOTTOM positions).
         """
         if isinstance(self.decision_data, torch.Tensor):
             self.decision_data = [[] for _ in range(len(self.decision_data))]
@@ -1450,37 +1368,13 @@ class EventLogDataset(Dataset):
                 )
 
         for idx, row_data in zip(target_indices, decision_list, strict=False):
-            if isinstance(row_data, torch.Tensor):
-                row_data = row_data.detach().cpu().tolist()
-            elif isinstance(row_data, np.ndarray):
-                row_data = row_data.tolist()
-            else:
-                row_data = list(row_data)
-
-            normalized_row: list[tuple[str, dict[str, float], float]] = []
+            normalized_row: list[tuple[str, dict[str, float]]] = []
             for entry in row_data:
-                if not isinstance(entry, tuple) or len(entry) not in (2, 3, 4):
+                if not isinstance(entry, tuple) or len(entry) != 2:
                     raise ValueError(
-                        "Each decision_data entry must be a tuple: "
-                        "(place_name, {label: prob}), "
-                        "(place_name, {label: prob}, c_i), or "
-                        "(place_name, A_i, {label: prob}, c_i)"
+                        "Each decision_data entry must be a (place_name, {label: prob}) tuple"
                     )
-
-                activity_label = entry[0]
-                probability_map = entry[1]
-                c_i: float = 0.0
-
-                # Supports both compact tuples and rich tuples with A_i:
-                # (p_i, z_i), (p_i, z_i, c_i), (p_i, A_i, z_i, c_i)
-                if len(entry) == 4 and isinstance(entry[1], list):
-                    probability_map = entry[2]
-                    c_i = float(entry[3])
-                elif len(entry) >= 3:
-                    c_i = float(entry[2])
-                elif isinstance(probability_map, dict) and probability_map:
-                    c_i = max(float(p) for p in probability_map.values())
-
+                place_name, probability_map = entry
                 if not isinstance(probability_map, dict):
                     raise ValueError(
                         "Each decision_data tuple must have a dict as second value"
@@ -1494,9 +1388,7 @@ class EventLogDataset(Dataset):
                         raise ValueError("Decision probabilities must be numeric")
                     normalized_map[label] = float(prob)
 
-                normalized_row.append(
-                    (str(activity_label), normalized_map, c_i)
-                )
+                normalized_row.append((str(place_name), normalized_map))
 
             expected_len = self._prefix_length_from_zero_mask(self.zero_padding[idx])
             if len(normalized_row) != expected_len:

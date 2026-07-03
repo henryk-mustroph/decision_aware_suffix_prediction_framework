@@ -1,88 +1,110 @@
-# Decision-Aware Suffix Prediction of Business Processes with Decision-Rule-Guided Reasoning
+# Decision-Aware Suffix Prediction and Reasoning of Business Processes
 
-## Setting Up the Python Environment with Pipenv
+## Abstract
+Suffix prediction forecasts the remaining sequence of events of a running case until completion. Most approaches rely on deep neural networks trained on event logs, which, on average, predict well but struggle when given short prefixes or when the target suffix belongs to a rare process variant. In such scenarios, the correct path may cross multiple branching decisions, determined primarily by case- and event-level attributes, a signal that DNN-based suffix prediction models tend to underweight. Decision mining extracts rules for such branching decisions from the event log, but has so far been applied only to post-hoc and what-if analysis, not to suffix prediction. We therefore extend suffix prediction with decision mining, introducing a decision-aware suffix prediction framework as a neuro-symbolic approach that additionally enables reasoning about predicted suffixes using mined decision rules. Experiments on three of four event logs with three different suffix predictors show that the framework can improve suffix prediction performance, especially for short prefixes, and adds intrinsic interpretability.
 
-This project uses `pipenv` for managing Python dependencies. Follow the steps below to set up the virtual environment and install the necessary packages using the provided `Pipfile`.
+## Repository Summary
 
-### Prerequisites
-Make sure you have **Python 3.12** and **Pipenv** installed. The `Pipfile` and `Pipfile.lock` require Python 3.12.
+This repository implements decision-aware suffix prediction for business processes. Given a running case
+(a prefix of events), the models predict the remaining suffix. Decisions discovered from a data-aware Petri
+net are injected in two complementary ways: as a **semantic loss during training** and as **decision-rule-guided
+reasoning during decoding**. The whole workflow — data preparation, decision mining, model training and
+evaluation — is driven from a single per-dataset notebook and a shared `experiments` package.
 
-### Setup Instructions
-
-Run the following commands from the **project root** (where the `Pipfile` is located):
-
-1. **Create the Virtual Environment**:
-    
-    ```bash
-    pipenv install
-    ```
-
-2. **Activate the Virtual Environment**:
-    
-    ```bash
-    pipenv shell
-    ```
-
-3. **Run the Project**: Inside the virtual environment, you have the Python packages installed for running the code.
-
-
-## Run the Decision-Aware Suffix Prediction of Business Processes with Decision-Rule-Guided Reasoning Framework: Data, Train and Evaluate.
-
-### Required Directory Structure per Dataset
-
-Before running any pipeline steps, the following directories must exist for each dataset (e.g. `<Dataset>` = `Helpdesk`, `Sepsis`, `Procurement`, `BPIC20_DD`):
+## Repository layout
 
 ```
-data/<Dataset>/
-    Petri_net/
-        data_aware_Petri_net/
-            models/
-    raw_data/
-    tensor_data/
-        decision_labeled/
-        normal/
+src/
+  data_processing/      # event-log encoding, prefix building, decision labeling, Petri-net replay
+  decision_mining/      # alignment-based decision discovery + CatBoost guard estimators
+  simulator/            # generator for the synthetic Procurement event log
+  suffix_pred/
+    models/             # FS_LSTM, GAN_LSTM, K_UED_LSTM architectures
+    train.py            # trainers (CTraining, TTraining, UEDTrainer)
+    inference.py        # decoders (mode / probabilistic MCSA / beam)
+    decision_rule_guided_reasoning_inference.py   # guided decoding
+    evalaution/         # suffix decoding over the test set + evaluation metrics
+    experiments/        # orchestration: configs, data_loading, decision_mining, training, evaluation
+  notebooks/
+    pipeline_<Dataset>.ipynb   # one end-to-end pipeline per dataset
+    run_all_pipelines.ipynb    # runs every pipeline notebook sequentially
+    figure_dls_all_datasets.ipynb + paper_figures/   # paper figures
 
-models/<Dataset>/
-    clean/
-    decision/
-
-eval_results/<Dataset>/
-    clean/
-    decision_decoding/
-    decision_train/
+data/          # generated tensors & Petri nets            (gitignored)
+models/        # trained checkpoints                        (gitignored)
+eval_results/  # cached decoding outputs & metrics          (gitignored)
 ```
 
-Create all directories for a new dataset with:
+All output directories under `data/`, `models/` and `eval_results/` are created automatically by the
+pipeline — you do **not** need to pre-create them.
+
+## Setting up the Python environment with Pipenv
+
+This project uses `pipenv` for dependency management. You need **Python 3.12** and **Pipenv** installed
+(the `Pipfile`/`Pipfile.lock` pin Python 3.12).
+
+Run from the **project root** (where the `Pipfile` lives):
 
 ```bash
-DATASET=<Dataset>
-mkdir -p \
-  data/$DATASET/Petri_net/data_aware_Petri_net/models \
-  data/$DATASET/raw_data \
-  data/$DATASET/tensor_data/decision_labeled \
-  data/$DATASET/tensor_data/normal \
-  models/$DATASET/clean \
-  models/$DATASET/decision \
-  eval_results/$DATASET/clean \
-  eval_results/$DATASET/decision_decoding \
-  eval_results/$DATASET/decision_train
+pipenv install     # create the virtual environment and install dependencies
+pipenv shell       # activate it
 ```
 
-### Pipeline Execution Order
+Register the environment as a Jupyter kernel named `python3` (the batch runner expects this kernel):
 
-The notebooks must be executed in the following order for each dataset:
+```bash
+python -m ipykernel install --user --name python3
+```
 
-1. **Base Loader** (`src/notebooks/suffix_prediction/data_loader/<Dataset>_base_loader.ipynb`)  
-   Preprocesses the raw event log, creates prefix dataframes, discovers the Petri net, and saves the "normal" (non-decision-labeled) tensor datasets.
+## Providing the raw event logs
 
-2. **Decision Mining** (`src/notebooks/decision_mining/<Dataset>_decision_mining.ipynb`)  
-   Runs alignment-based decision discovery on the Petri net, trains decision models per decision place, extracts probabilistic guards, and saves the model artifacts.
+The real-world event logs are **not** redistributed with this repository. Each dataset expects a raw CSV at a
+location resolved by `experiments/configs.py` (`raw_root`, relative to `src/notebooks/`, plus the per-dataset
+`event_log_location`). By default `raw_root = "../../../../"`, so the logs are read from a shared store outside
+the repository — e.g. `<parent-of-repo-root>/data/data/`:
 
-3. **Decision Labeling Loader** (`src/notebooks/suffix_prediction/data_loader/<Dataset>_decision_labeling_loader.ipynb`)  
-   Loads the normal tensor datasets and decision mining artifacts, computes decision labels for each prefix, and saves the decision-labeled tensor datasets.
+| Dataset       | Expected raw file (`event_log_location`) |
+| ------------- | ---------------------------------------- |
+| `Helpdesk`    | `data/data/helpdesk.csv`                 |
+| `Sepsis`      | `data/data/Sepsis.csv`                   |
+| `Procurement` | `data/data/procurement_event_log.csv`    |
+| `BPIC20_DD`   | `data/data/DomesticDeclarations.csv`     |
 
-4. **Training** (`src/notebooks/suffix_prediction/trainer/<Dataset>/`)  
-   Trains the suffix prediction models (C-LSTM, T-GAN-LSTM, K-UED-LSTM) in both the `clean/` (baseline) and `decision/` (decision-aware) variants.
+Place your logs at these paths, or edit `raw_root` / `event_log_location` in `experiments/configs.py` to point
+at your own location. The **Procurement** log is synthetic and can be regenerated with
+`src/simulator/artificial_procurement.py` (a generated copy is checked in at
+`src/simulator/procurement_event_log.csv`).
 
-5. **Evaluation** (`src/notebooks/suffix_prediction/evaluation/<Dataset>/`)  
-   Evaluates the trained models under `clean/`, `decision_decoding/`, and `decision_train/` conditions and writes results to `eval_results/<Dataset>/`.
+## Running the framework
+
+Each dataset has a self-contained pipeline notebook in `src/notebooks/`
+(`pipeline_Helpdesk.ipynb`, `pipeline_Sepsis.ipynb`, `pipeline_Procurement.ipynb`, `pipeline_BPIC20_DD.ipynb`).
+Run the notebooks **from the `src/notebooks/` directory** — the first cell adds `../` to `sys.path` so that
+`import suffix_pred.experiments` resolves.
+
+Every pipeline runs five stages, each toggled by a `RUN_*` switch in the first code cell:
+
+1. **`RUN_BASE`** — encode the raw log into "normal" tensor datasets and discover the Petri net.
+2. **`RUN_MINING`** — alignment-based decision discovery + per-place guard estimators.
+3. **`RUN_LABELING`** — build the decision-labeled tensor datasets (needs stage 2 output).
+4. **`RUN_TRAINING`** — train the checkpoints (slow; overwrites `models/`).
+5. **`RUN_EVAL`** — decode the test set and compute metrics (slow; overwrites the eval cache).
+
+The trained architectures (`MODELS`) and evaluation conditions (`Variant`) are:
+
+- **Models:** `UED` (Dropout-Uncertainty Encoder-Decoder LSTM), `FS` (Full-Shared next-event LSTM),
+  `GAN` (Taymouri adversarial LSTM).
+- **Variants:** `clean` (baseline), `decision_train` (semantic-loss training), `decision_decoding`
+  (decision-rule-guided decoding of the clean model), `decision_train_decode` (both).
+
+### Run every dataset at once
+
+`src/notebooks/run_all_pipelines.ipynb` executes each pipeline notebook in an isolated subprocess via
+`nbconvert --execute --inplace`, writing per-notebook logs to `pipeline_<Dataset>.run.log` (gitignored).
+
+## Configuration
+
+`src/suffix_pred/experiments/configs.py` is the single source of truth for every per-(dataset, model, variant)
+difference: attribute lists, concept names, hyperparameters and all path conventions. Paths for tensors,
+checkpoints and eval caches are derived there by convention, so adding a dataset or model means editing that
+file only.

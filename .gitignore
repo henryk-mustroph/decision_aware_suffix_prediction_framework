@@ -1,8 +1,12 @@
-
+# Generated data & experiment artifacts (produced by the pipeline notebooks)
 data/*
-
 eval_results/*
-
 models/*
 
+# Python / Jupyter cruft
 __pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Notebook execution logs (e.g. papermill / nbconvert output)
+*.run.log

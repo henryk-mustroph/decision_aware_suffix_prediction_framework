@@ -75,6 +75,52 @@ def _collect_probabilistic_case_chunk(case_ids: list[str]) -> list[dict]:
     return rows
 
 
+# Parallel deterministic worker helpers (module-level for pickling).
+# Covers the "mode" (arg-max) and "beam" decoders. We reuse each evaluator's
+# own ``evaluate`` by restricting its ``cases`` to the worker's chunk, so the
+# per-case decoding logic stays identical to the serial path.
+_DET_WORKER_DECODER = None
+_DET_WORKER_MODE = None
+_DET_WORKER_CASES = None
+
+
+def _init_deterministic_worker(model,
+                               dataset,
+                               concept_name: str,
+                               eos_value: str,
+                               mode: str,
+                               beam_width: int):
+    """Create one deterministic decoder per process."""
+    global _DET_WORKER_DECODER, _DET_WORKER_MODE, _DET_WORKER_CASES
+    kwargs = {"model": model, "dataset": dataset,
+              "concept_name": concept_name, "eos_value": eos_value}
+    if mode == "beam":
+        kwargs["beam_width"] = beam_width
+    _DET_WORKER_DECODER = get_evaluator(kind=mode, **kwargs)
+    _DET_WORKER_MODE = mode
+    _DET_WORKER_CASES = dict(_DET_WORKER_DECODER.cases)
+
+
+def _collect_deterministic_case_chunk(case_ids: list[str]) -> list[dict]:
+    """Decode a chunk of case ids with the per-process deterministic decoder."""
+    if _DET_WORKER_DECODER is None:
+        raise RuntimeError("Deterministic worker decoder is not initialized.")
+
+    decoder = _DET_WORKER_DECODER
+    decoder.cases = {cid: _DET_WORKER_CASES[cid]
+                     for cid in case_ids if cid in _DET_WORKER_CASES}
+
+    rows: list[dict] = []
+    for case_id, prefix_len, prefix, target_suffix, decoded_suffixes in decoder.evaluate(random_order=False):
+        rows.append({"case_id": case_id,
+                     "prefix_len": int(prefix_len),
+                     "prefix": prefix,
+                     "target_suffix": target_suffix,
+                     "decoded_suffixes": decoded_suffixes,
+                     "mode": _DET_WORKER_MODE})
+    return rows
+
+
 # Main decoder class
 class TestSetSuffixDecoder:
     """
@@ -129,8 +175,8 @@ class TestSetSuffixDecoder:
         - random_order : bool: Shuffle the order of cases before decoding.
         - cache_path : str
         - reuse_cache : bool: When *True* and *cache_path* points to an existing file, the cached results are returned without re-running inference.
-        - parallel_inference : bool: Enable multi-process inference for the ``"probabilistic"`` mode.
-        - num_processes : int, optional: Number of worker processes (probabilistic mode only).
+        - parallel_inference : bool: Enable multi-process inference for all modes.
+        - num_processes : int, optional: Number of worker processes.
 
         Outputs:
         - list[dict]
@@ -150,7 +196,10 @@ class TestSetSuffixDecoder:
                                                  parallel_inference=parallel_inference,
                                                  num_processes=num_processes)
         else:
-            outputs = self._decode_deterministic(mode=mode, random_order=random_order)
+            outputs = self._decode_deterministic(mode=mode,
+                                                 random_order=random_order,
+                                                 parallel_inference=parallel_inference,
+                                                 num_processes=num_processes)
 
         if cache_path is not None:
             with open(cache_path, "wb") as handle:
@@ -158,20 +207,52 @@ class TestSetSuffixDecoder:
 
         return outputs
 
-    def _decode_deterministic(self, mode: DecodeMode, random_order: bool = False) -> list[dict]:
+    def _decode_deterministic(self,
+                              mode: DecodeMode,
+                              random_order: bool = False,
+                              parallel_inference: bool = True,
+                              num_processes: Optional[int] = None) -> list[dict]:
         """
-        Decode suffixes using a deterministic (non-probabilistic) decoder.
+        Decode suffixes using a deterministic (``"mode"`` / ``"beam"``) decoder.
+        Runs across processes when ``parallel_inference`` is enabled, mirroring
+        the probabilistic path.
         """
         decoder = self._build_decoder(mode)
-        outputs: list[dict] = []
-        for case_id, prefix_len, prefix, target_suffix, decoded_suffixes in decoder.evaluate(random_order=random_order):
-            outputs.append({"case_id": case_id,
-                            "prefix_len": int(prefix_len),
-                            "prefix": prefix,
-                            "target_suffix": target_suffix,
-                            "decoded_suffixes": decoded_suffixes,
-                            "mode": mode})
-            
+        case_ids = list(decoder.cases.keys())
+        if random_order:
+            random.shuffle(case_ids)
+
+        worker_count = max(1, int(num_processes or self.config.num_processes or 1))
+        use_parallel = parallel_inference and worker_count > 1 and len(case_ids) > 1
+
+        if not use_parallel:
+            outputs: list[dict] = []
+            for case_id, prefix_len, prefix, target_suffix, decoded_suffixes in decoder.evaluate(random_order=random_order):
+                outputs.append({"case_id": case_id,
+                                "prefix_len": int(prefix_len),
+                                "prefix": prefix,
+                                "target_suffix": target_suffix,
+                                "decoded_suffixes": decoded_suffixes,
+                                "mode": mode})
+            return outputs
+
+        chunk_size = max(1, (len(case_ids) + worker_count - 1) // worker_count)
+        case_chunks = [case_ids[i : i + chunk_size] for i in range(0, len(case_ids), chunk_size)]
+        beam_width = int(getattr(self.config, "beam_width", 3) or 3)
+
+        outputs = []
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=worker_count,
+            initializer=_init_deterministic_worker,
+            initargs=(self.model, self.dataset, self.config.concept_name,
+                      self.config.eos_value, mode, beam_width)) as executor:
+
+            futures = [executor.submit(_collect_deterministic_case_chunk, case_chunk)
+                       for case_chunk in case_chunks]
+            for future in tqdm(concurrent.futures.as_completed(futures),
+                               total=len(futures), desc=f"{mode} inference chunks"):
+                outputs.extend(future.result())
+
         return outputs
 
     def _decode_probabilistic(self,

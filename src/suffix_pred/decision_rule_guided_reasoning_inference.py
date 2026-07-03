@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 
 # performance imports for torch: torch kernel uses one core only.
 import os
@@ -20,6 +23,152 @@ from data_processing.decision_labeling import DecisionLabeler
 # use the inference modes implemented also in the standard case
 from .inference import Mode, Beam, MCSA
 
+# Display-only helpers. Notebooks import these to pretty-print cached reasoning
+# traces; the decoding loop itself does NOT call them, so they have no impact
+# on guard matching, conflict counts, or any persisted metric.
+
+# Past-summary suffixes added by `_build_feature_row`. We strip them to recover
+# the base column name so we can look up the corresponding scaler. The bare
+# attribute name (the value at the event right before the decision point) has
+# no suffix, so this regex matches only the summary columns.
+_LAG_SUFFIX_RE = re.compile(
+    r"(_past_avg|_past_mode)$"
+)
+
+# Matches "(feature <= 1.23e+06)" or "(feature > -0.4)" — but NOT
+# "(feature in {...})". Used to rewrite numeric thresholds in rule strings.
+_NUMERIC_COND_RE = re.compile(
+    r"\(([\w]+)\s*(<=|>)\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\)"
+)
+
+
+def _strip_lag_suffix(feature_full_name: str) -> str:
+    return _LAG_SUFFIX_RE.sub("", str(feature_full_name))
+
+
+def _is_time_feature(base_feature_name: str) -> bool:
+    return "time" in str(base_feature_name).lower()
+
+
+def inverse_transform_for_display(feature_full_name: str,
+                                   scaled_value: Any,
+                                   numeric_scalers: Dict[str, Any]) -> Optional[float]:
+    """
+    Inverse-transform a scaled scalar back to its original-units value using
+    the scaler registered for the base feature. Returns the input unchanged
+    when no scaler applies. Non-numeric input -> None.
+    """
+    if scaled_value is None:
+        return None
+    try:
+        scaled = float(scaled_value)
+    except (TypeError, ValueError):
+        return None
+    if not numeric_scalers:
+        return scaled
+    base = _strip_lag_suffix(feature_full_name)
+    scaler = numeric_scalers.get(base)
+    if scaler is None or not hasattr(scaler, "inverse_transform"):
+        return scaled
+    try:
+        return float(np.asarray(scaler.inverse_transform([[scaled]])).reshape(-1)[0])
+    except Exception:
+        return scaled
+
+
+def format_duration_seconds(seconds: float) -> str:
+    """
+    Render a seconds value as a human-readable duration. Small negatives -
+    which arise from float arithmetic on the mean of z-scaled times (first
+    events of a case have raw=0, z ~= -1.25, and averaging a handful of such
+    values can drift fractionally below the scaler's zero) - are clamped to
+    0 since negative elapsed times are physically impossible.
+    """
+    s = float(seconds)
+    # Clamp tiny negatives that arise from float rounding of z-score
+    # arithmetic. Anything more negative than 1 second is genuinely odd and
+    # we surface it with a leading minus sign so the user notices.
+    if -1.0 < s < 0.0:
+        s = 0.0
+    sign = "-" if s < 0 else ""
+    s = abs(s)
+    if s >= 86400.0:
+        return f"{sign}{s / 86400.0:.2f} days"
+    if s >= 3600.0:
+        return f"{sign}{s / 3600.0:.2f} hours"
+    if s >= 60.0:
+        return f"{sign}{s / 60.0:.2f} minutes"
+    return f"{sign}{s:.2f} seconds"
+
+
+def format_number_for_display(value: float) -> str:
+    """
+    Render a non-time continuous attribute (e.g. BPIC2020 ``case:Amount``) in a
+    human-readable way, the generic counterpart to :func:`format_duration_seconds`
+    for durations. The goal is the same: surface the value in its original units
+    so the reasoning trace is interpretable, rather than the raw ``%g`` output
+    which collapses larger magnitudes into scientific notation (``1.234e+04``).
+
+    Behaviour:
+      - integral values  -> thousands-grouped integer (``12,340``)
+      - fractional values -> thousands-grouped, two decimals (``12,340.50``)
+      - extreme magnitudes (>= 1e9 or tiny non-zero < 1e-4) fall back to compact
+        scientific, where grouping would be unreadable anyway.
+    """
+    v = float(value)
+    a = abs(v)
+    if a != 0.0 and (a >= 1e9 or a < 1e-4):
+        return f"{v:.4g}"
+    if v.is_integer():
+        return f"{int(v):,d}"
+    return f"{v:,.2f}"
+
+
+def format_value_for_display(feature_full_name: str,
+                              value: Any,
+                              numeric_scalers: Dict[str, Any]) -> str:
+    """
+    Render a feature value for a human-readable reasoning trace:
+      - categorical (str) values pass through unchanged
+      - numeric values are inverse-transformed via the registered scaler
+      - columns whose base name contains 'time' are rendered as durations
+      - any other continuous attribute is rendered with thousands grouping and
+        original-unit precision (see :func:`format_number_for_display`)
+    """
+    if value is None:
+        return "None"
+    if isinstance(value, str):
+        return value
+    raw = inverse_transform_for_display(feature_full_name, value, numeric_scalers)
+    if raw is None:
+        return str(value)
+    base = _strip_lag_suffix(feature_full_name)
+    if _is_time_feature(base):
+        return format_duration_seconds(raw)
+    return format_number_for_display(raw)
+
+
+def render_rule_for_display(rule_str: str,
+                             numeric_scalers: Dict[str, Any]) -> str:
+    """
+    Re-render a rule string so numeric thresholds are shown in original units
+    (and as durations for *_time features). Categorical 'X in {...}'
+    conditions pass through unchanged.
+    """
+    if not rule_str:
+        return rule_str
+
+    def _sub(m: "re.Match[str]") -> str:
+        feat, op, num_s = m.group(1), m.group(2), m.group(3)
+        try:
+            scaled = float(num_s)
+        except ValueError:
+            return m.group(0)
+        return f"({feat} {op} {format_value_for_display(feat, scaled, numeric_scalers)})"
+
+    return _NUMERIC_COND_RE.sub(_sub, rule_str)
+
+
 @dataclass
 class DecisionGuidanceConfig:
     """
@@ -29,6 +178,27 @@ class DecisionGuidanceConfig:
     beta_max: float = 2.0
     alpha: float = 0.1
     support_threshold: float = 0.05
+
+    # --- confidence / observability gating -------------------------------
+    # Reweight a decision step ONLY when guidance is trustworthy. All three
+    # gates default to no-ops so existing behaviour (always guide) is preserved
+    # unless explicitly configured. See `_masked_distribution`.
+    #
+    # (a) Base-model uncertainty: skip guidance when the model's own next-event
+    #     distribution is already peaked (normalised entropy < this). The model
+    #     is confident, so steering can only perturb a good prediction (this is
+    #     the BPIC20-style regression). 0.0 => never skip on this ground.
+    min_base_entropy: float = 0.0
+    # (b) Decision-model confidence: skip guidance when the mined model's top
+    #     branch probability c_i = max_a z_i(a) < this, i.e. it has nothing
+    #     decisive to say. 0.0 => never skip on this ground.
+    min_decision_confidence: float = 0.0
+    # (c) Observability: only guide while the decode step index <= this. At
+    #     step 0 the deciding event/attributes come from the OBSERVED prefix;
+    #     from step 1 on they are autoregressively PREDICTED (lab values, times,
+    #     ...), so z_i is built on guesses and steering compounds the error (the
+    #     Sepsis collapse). None => no cutoff (guide at every step).
+    max_guided_steps: Optional[int] = None
 
 class DecisionRuleGuidedMixin:
     """
@@ -60,6 +230,19 @@ class DecisionRuleGuidedMixin:
         self.last_conflicts: int = 0
         self.last_decision_steps: int = 0
         self.last_explained_steps: int = 0
+        # Non-trivial = decision step where at least 2 outcomes pass the support
+        # threshold. Quasi-deterministic XOR places (one branch >= 1 - tau) are
+        # excluded from the non-trivial explained rate because there is no real
+        # data dependency to explain.
+        self.last_non_trivial_decision_steps: int = 0
+        self.last_non_trivial_explained_steps: int = 0
+        # Explainable = non-conflicting decision step whose chosen branch has a
+        # data-aware rule available (>= 1 mined guard carrying attribute
+        # conditions). The rule_explained_rate (explained / explainable) is the
+        # primary explainability indicator: it isolates "could we apply the rule
+        # that exists?" from rule-base coverage gaps (branches with no rule) and
+        # from conflicts (which are never explainable by construction).
+        self.last_explainable_decision_steps: int = 0
 
     @staticmethod
     def _load_reasoning_guards(decision_places_bundle_path: Optional[str]) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
@@ -115,46 +298,63 @@ class DecisionRuleGuidedMixin:
 
         return attrs
 
-    def _decode_event_attrs_from_suffix_step(self,
-                                             suffix: Tuple[List[torch.Tensor], List[torch.Tensor]],
-                                             step_idx: int,
-                                             activity_id: int,
-                                             static_inputs: Any,) -> Dict[str, Any]:
+    def _decode_event_attrs_from_predicted_step(self,
+                                                activity_id: int,
+                                                predicted_cat_ids: Optional[Dict[str, int]],
+                                                predicted_num_values: Optional[Dict[str, float]],
+                                                prefix: Tuple[List[torch.Tensor], List[torch.Tensor]],
+                                                static_inputs: Any) -> Dict[str, Any]:
         """
-        Build event attributes using predicted activity and GT non-activity attrs at step_idx.
+        Build event attributes for the decision context using only
+        model-predicted values (and carry-forward from the last prefix event
+        where no prediction is available). No ground-truth suffix values are
+        consulted, so the decoder never leaks future event attributes.
         """
-        suffix_cats, suffix_nums = suffix
+        predicted_cat_ids = dict(predicted_cat_ids or {})
+        predicted_num_values = dict(predicted_num_values or {})
+
         cat_ids: Dict[str, int] = {}
         num_vals: Dict[str, float] = {}
+
+        prefix_cats, prefix_nums = prefix
 
         for i, feature_name in enumerate(self._cat_feature_names):
             if i == self.concept_name_id:
                 cat_ids[feature_name] = int(activity_id)
                 continue
-            if i >= len(suffix_cats) or step_idx >= suffix_cats[i].shape[1]:
-                continue
-            cat_ids[feature_name] = int(suffix_cats[i][0, step_idx].item())
+            if feature_name in predicted_cat_ids:
+                cat_ids[feature_name] = int(predicted_cat_ids[feature_name])
+            elif i < len(prefix_cats):
+                cat_ids[feature_name] = int(prefix_cats[i][0, -1].item())
 
         for i, feature_name in enumerate(self._num_feature_names):
-            if i >= len(suffix_nums) or step_idx >= suffix_nums[i].shape[1]:
-                continue
-            num_vals[feature_name] = float(suffix_nums[i][0, step_idx].item())
+            if feature_name in predicted_num_values:
+                new_val = float(predicted_num_values[feature_name])
+                if i < len(prefix_nums):
+                    new_val = self._enforce_monotone(feature_name, new_val,
+                                                     float(prefix_nums[i][0, -1].item()))
+                num_vals[feature_name] = new_val
+            elif i < len(prefix_nums):
+                num_vals[feature_name] = float(prefix_nums[i][0, -1].item())
 
         next_event_attrs = self._decode_event_attrs_from_predicted_ids(predicted_cat_ids=cat_ids,
                                                                        predicted_num_values=num_vals)
         next_event_attrs.update(self._extract_static_attrs(static_inputs))
         return self.decision_labeler._filter_attributes(next_event_attrs)
 
-    def _roll_prefix_with_activity_from_suffix(self,
-                                               prefix: Tuple[List[torch.Tensor], List[torch.Tensor]],
-                                               suffix: Tuple[List[torch.Tensor], List[torch.Tensor]],
-                                               step_idx: int,
-                                               activity_id: int) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    def _roll_prefix_with_predicted_attrs(self,
+                                          prefix: Tuple[List[torch.Tensor], List[torch.Tensor]],
+                                          activity_id: int,
+                                          predicted_cat_ids: Optional[Dict[str, int]] = None,
+                                          predicted_num_values: Optional[Dict[str, float]] = None) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
-        Roll prefix and append predicted activity with GT non-activity attributes at step_idx.
+        Roll prefix and append predicted activity. Non-activity attributes come from
+        model predictions (where available) or carry-forward from the last prefix
+        event - never from ground-truth suffix.
         """
         prefix_cats, prefix_nums = prefix
-        suffix_cats, suffix_nums = suffix
+        predicted_cat_ids = dict(predicted_cat_ids or {})
+        predicted_num_values = dict(predicted_num_values or {})
 
         new_cats: List[torch.Tensor] = []
         for i, cat in enumerate(prefix_cats):
@@ -162,22 +362,54 @@ class DecisionRuleGuidedMixin:
             if i == self.concept_name_id:
                 shifted[:, -1] = activity_id
             else:
-                if step_idx < suffix_cats[i].shape[1]:
-                    shifted[:, -1] = suffix_cats[i][:, step_idx]
+                feature_name = self._cat_feature_names[i] if i < len(self._cat_feature_names) else None
+                if feature_name is not None and feature_name in predicted_cat_ids:
+                    shifted[:, -1] = int(predicted_cat_ids[feature_name])
                 else:
-                    shifted[:, -1] = 0
+                    shifted[:, -1] = cat[:, -1]
             new_cats.append(shifted)
 
         new_nums: List[torch.Tensor] = []
         for i, num in enumerate(prefix_nums):
             shifted = torch.roll(num.clone(), shifts=-1, dims=1)
-            if step_idx < suffix_nums[i].shape[1]:
-                shifted[:, -1] = suffix_nums[i][:, step_idx]
+            feature_name = self._num_feature_names[i] if i < len(self._num_feature_names) else None
+            if feature_name is not None and feature_name in predicted_num_values:
+                new_val = self._enforce_monotone(feature_name,
+                                                 float(predicted_num_values[feature_name]),
+                                                 float(num[0, -1].item()))
+                shifted[:, -1] = new_val
             else:
                 shifted[:, -1] = num[:, -1]
             new_nums.append(shifted)
 
         return (new_cats, new_nums)
+
+    @staticmethod
+    def _enforce_monotone(feature_name: str, new_val: float, prev_val: float) -> float:
+        """Clamp cumulative features (case_elapsed_time) to be non-decreasing."""
+        if "case_elapsed" in str(feature_name).lower():
+            return max(new_val, prev_val)
+        return new_val
+
+    def _predict_next_event(self, current_prefix: Tuple[List[torch.Tensor], List[torch.Tensor]]) -> Tuple[Dict[str, int], Dict[str, float]]:
+        """
+        Query the model for next-event non-activity attribute predictions.
+        Returns (cat_ids, num_values) dicts; empty dicts if the model does not
+        expose a `predict_next_event` helper (carry-forward used downstream).
+        """
+        if not hasattr(self.model, "predict_next_event") or not callable(self.model.predict_next_event):
+            return {}, {}
+        try:
+            model_prefix = self._project_prefix_for_model(current_prefix)
+        except AttributeError:
+            model_prefix = current_prefix
+        try:
+            preds = self.model.predict_next_event(model_prefix)
+        except Exception:
+            return {}, {}
+        cat_ids = {feat: int(t.item()) for feat, t in preds.get("cat_ids", {}).items()}
+        num_values = {feat: float(t.item()) for feat, t in preds.get("num_values", {}).items()}
+        return cat_ids, num_values
 
     def _extract_static_attrs(self, static_inputs: Any) -> Dict[str, Any]:
         if static_inputs is None:
@@ -245,12 +477,46 @@ class DecisionRuleGuidedMixin:
         c_i = max(z_i.values(), default=0.0)
         return place_name, z_i, float(c_i)
 
-    def _masked_distribution(self, base_probs: torch.Tensor, z_i: Dict[str, float], c_i: float, step_idx: int) -> torch.Tensor:
+    def _masked_distribution(self, base_probs: torch.Tensor, z_i: Dict[str, float], step_idx: int) -> torch.Tensor:
         if len(z_i) == 0:
             return base_probs
 
         cfg = self.guidance_config
-        beta_r = float(c_i) * float(cfg.beta_max) * math.exp(-float(cfg.alpha) * float(step_idx))
+
+        # --- confidence / observability gating -------------------------------
+        # Only steer when guidance is trustworthy; otherwise leave the model's
+        # own distribution untouched (the step is still scored for conflicts /
+        # explainability against z_i downstream, it is just not reweighted).
+
+        # (c) Observability: once decoding rolls past `max_guided_steps`, the
+        # decision context is built from PREDICTED attributes rather than the
+        # observed prefix, so z_i is unreliable -> stop guiding to avoid the
+        # autoregressive error chain (Sepsis-style collapse).
+        if cfg.max_guided_steps is not None and step_idx > int(cfg.max_guided_steps):
+            return base_probs
+
+        # (b) Decision-model confidence: no branch clears the floor -> the mined
+        # model is not decisive here, so don't steer.
+        if cfg.min_decision_confidence > 0.0:
+            c_i = max(z_i.values(), default=0.0)
+            if float(c_i) < float(cfg.min_decision_confidence):
+                return base_probs
+
+        # (a) Base-model uncertainty: the model's own next-event distribution is
+        # already peaked (low normalised entropy) -> it is confident and
+        # guidance can only perturb a good prediction, so leave it.
+        if cfg.min_base_entropy > 0.0:
+            num_classes = int(base_probs.shape[-1])
+            if num_classes > 1:
+                p = base_probs.clamp_min(1e-12)
+                norm_entropy = float(-(p * p.log()).sum().item()) / math.log(num_classes)
+                if norm_entropy < float(cfg.min_base_entropy):
+                    return base_probs
+
+        # Guidance sharpness beta_r = beta_max * exp(-alpha * r): max strength
+        # beta_max decayed by alpha at later steps r (where the data state is
+        # accumulated from predicted, less reliable attributes).
+        beta_r = float(cfg.beta_max) * math.exp(-float(cfg.alpha) * float(step_idx))
         if beta_r <= 0.0:
             return base_probs
 
@@ -320,6 +586,31 @@ class DecisionRuleGuidedMixin:
                 return False
 
         return True
+
+    @staticmethod
+    def _guard_has_conditions(guard: Dict[str, Any]) -> bool:
+        """True iff the guard carries at least one data-aware condition.
+
+        A guard with no intervals and no categorical allow/exclude sets is a
+        vacuous ``(true)`` rule that explains nothing.
+        """
+        return (bool(guard.get("intervals"))
+                or bool(guard.get("categorical_allowed"))
+                or bool(guard.get("categorical_excluded")))
+
+    def _branch_has_conditioned_rule(self, place_name: str, next_activity_label: str) -> bool:
+        """
+        True iff the mined rule base provides at least one *data-aware* guard
+        (carrying attribute conditions) for choosing ``next_activity_label`` at
+        ``place_name``.
+
+        Used to scope the explainability denominator: a non-conflicting step
+        whose chosen branch has no conditioned rule reflects a rule-base
+        coverage gap, not a failure of the reasoning component, so it is
+        excluded from ``explainable_decision_steps``.
+        """
+        guards = self._reasoning_bundle_guards.get(place_name, {}).get(str(next_activity_label), [])
+        return any(self._guard_has_conditions(g) for g in guards)
 
     def _best_matching_guard(self,
                              place_name: str,
@@ -413,23 +704,51 @@ class DecisionRuleGuidedMixin:
         top_decision_event = str(sorted_decisions[0][0]) if len(sorted_decisions) > 0 else None
         top_decision_prob = float(sorted_decisions[0][1]) if len(sorted_decisions) > 0 else None
 
+        is_non_trivial = len(supported) >= 2
+
         self.last_decision_steps += 1
         if conflict:
             self.last_conflicts += 1
+        if is_non_trivial:
+            self.last_non_trivial_decision_steps += 1
 
         matched_guard = None
         attribute_checks: List[Dict[str, Any]] = []
-        explanation_status = "conflict_not_supported" if conflict else "no_matching_rule"
+        explanation_status = "conflict_not_supported"
         explained = False
+        branch_has_rule = False
 
         if not conflict:
+            # Does the rule base provide a data-aware rule for this branch at all?
+            branch_has_rule = self._branch_has_conditioned_rule(place_name, selected_activity)
+            if branch_has_rule:
+                self.last_explainable_decision_steps += 1
+
             matched_guard = self._best_matching_guard(place_name, selected_activity, past_events)
-            if matched_guard is not None:
+            matched_with_conditions = (matched_guard is not None
+                                       and self._guard_has_conditions(matched_guard))
+            if matched_with_conditions:
                 feature_row = self.decision_labeler._build_feature_row(past_events)
                 attribute_checks = self._build_attribute_checks(feature_row, matched_guard)
+
+            # A step is data-aware-explained only when a conditioned guard
+            # matched and contributed >= 1 attribute check.
+            if matched_with_conditions and len(attribute_checks) > 0:
                 self.last_explained_steps += 1
+                if is_non_trivial:
+                    self.last_non_trivial_explained_steps += 1
                 explanation_status = "explained"
                 explained = True
+            elif branch_has_rule:
+                # A data-aware rule exists for this branch but none matched the
+                # current (predicted) data state - a genuine reasoning miss.
+                explanation_status = "rule_unmatched"
+            elif matched_guard is not None:
+                # Only a vacuous (true) guard exists/matched for this branch.
+                explanation_status = "matched_trivial_rule"
+            else:
+                # The rule base has no guard for this (place, activity) branch.
+                explanation_status = "no_rule_for_branch"
 
         self.last_reasoning_trace.append({"step": int(step_idx),
                                           "place": place_name,
@@ -440,8 +759,10 @@ class DecisionRuleGuidedMixin:
                                           "decision_top_event": top_decision_event,
                                           "decision_top_prob": top_decision_prob,
                                           "supported_set": [str(a) for a in supported],
+                                          "is_non_trivial": bool(is_non_trivial),
                                           "conflict": bool(conflict),
                                           "explained": bool(explained),
+                                          "branch_has_rule": bool(branch_has_rule),
                                           "explanation_status": str(explanation_status),
                                           "decision_distribution": {k: float(v) for k, v in z_i.items()},
                                           "attribute_checks": attribute_checks,
@@ -459,12 +780,59 @@ class DecisionRuleGuidedMixin:
         explained_rate = 0.0
         if self.last_decision_steps > 0:
             explained_rate = float(self.last_explained_steps) / float(self.last_decision_steps)
-        
+        # Trivial steps (one outcome dominates above 1 - support_threshold)
+        # contain no real data dependency, so the non-trivial rate is the more
+        # meaningful explainability number for the paper.
+        trivial_decision_steps = int(self.last_decision_steps) - int(self.last_non_trivial_decision_steps)
+        non_trivial_explained_rate = 0.0
+        if self.last_non_trivial_decision_steps > 0:
+            non_trivial_explained_rate = (float(self.last_non_trivial_explained_steps)
+                                          / float(self.last_non_trivial_decision_steps))
+
+        # Primary explainability indicator: of non-conflicting steps whose chosen
+        # branch HAS a data-aware rule, the fraction we actually explained. This
+        # excludes (a) conflicts (never explainable) and (b) branches with no
+        # mined rule (a coverage gap, not a reasoning failure), isolating the
+        # reasoning component's ability to apply the rule that exists.
+        rule_explained_rate = 0.0
+        if self.last_explainable_decision_steps > 0:
+            rule_explained_rate = (float(self.last_explained_steps)
+                                   / float(self.last_explainable_decision_steps))
+
+        # Per-status breakdown of why steps were NOT explained:
+        #   conflict_not_supported : model chose an activity outside the support
+        #   no_rule_for_branch     : the chosen branch has no mined rule at all
+        #   matched_trivial_rule   : only a vacuous (true) rule applies
+        #   rule_unmatched         : a data-aware rule exists but none matched
+        #                            the current (predicted) data state
+        def _count(status):
+            return sum(1 for r in self.last_reasoning_trace
+                       if r.get("explanation_status") == status)
+
+        matched_trivial_rule = _count("matched_trivial_rule")
+        rule_unmatched = _count("rule_unmatched")
+        no_rule_for_branch = _count("no_rule_for_branch")
+        conflict_not_supported = _count("conflict_not_supported")
+        # Backward-compatible alias: the old "no_matching_rule" bucket is the
+        # union of the two no-data-aware-explanation outcomes.
+        no_matching_rule = rule_unmatched + no_rule_for_branch
+
         return {"decision_steps": int(self.last_decision_steps),
                 "conflicts": int(self.last_conflicts),
                 "conflict_rate": float(rate),
                 "explained_steps": int(self.last_explained_steps),
                 "explained_rate": float(explained_rate),
+                "explainable_decision_steps": int(self.last_explainable_decision_steps),
+                "rule_explained_rate": float(rule_explained_rate),
+                "non_trivial_decision_steps": int(self.last_non_trivial_decision_steps),
+                "non_trivial_explained_steps": int(self.last_non_trivial_explained_steps),
+                "non_trivial_explained_rate": float(non_trivial_explained_rate),
+                "trivial_decision_steps": int(trivial_decision_steps),
+                "matched_trivial_rule": int(matched_trivial_rule),
+                "rule_unmatched": int(rule_unmatched),
+                "no_rule_for_branch": int(no_rule_for_branch),
+                "no_matching_rule": int(no_matching_rule),
+                "conflict_not_supported": int(conflict_not_supported),
                 "trace": list(self.last_reasoning_trace)}
 
     def _reset_reasoning_state(self) -> None:
@@ -472,6 +840,9 @@ class DecisionRuleGuidedMixin:
         self.last_conflicts = 0
         self.last_decision_steps = 0
         self.last_explained_steps = 0
+        self.last_non_trivial_decision_steps = 0
+        self.last_non_trivial_explained_steps = 0
+        self.last_explainable_decision_steps = 0
 
 
 class GuidedMode(DecisionRuleGuidedMixin, Mode):
@@ -496,6 +867,8 @@ class GuidedMode(DecisionRuleGuidedMixin, Mode):
         )
 
     def decode_suffix(self, prefix, suffix, prefix_len, static_inputs=None, return_reasoning=False):
+        # `suffix` is accepted for API parity only. It is never read; doing so
+        # would leak ground-truth future-event attributes into the decoder.
         max_iteration = (self.dataset.encoder_decoder.window_size - self.dataset.encoder_decoder.min_suffix_size - prefix_len)
 
         self._reset_reasoning_state()
@@ -516,8 +889,8 @@ class GuidedMode(DecisionRuleGuidedMixin, Mode):
             if input_activity:
                 decision_context = self._get_decision_context(input_activity, past_events)
                 if decision_context is not None:
-                    _, z_i, c_i = decision_context
-                    masked_probs = self._masked_distribution(probs, z_i, c_i, step_idx)
+                    _, z_i, _ = decision_context
+                    masked_probs = self._masked_distribution(probs, z_i, step_idx)
 
             activity_id = int(torch.argmax(masked_probs, dim=-1).item())
             if activity_id == self.eos_id:
@@ -525,7 +898,7 @@ class GuidedMode(DecisionRuleGuidedMixin, Mode):
 
             selected_activity = self._activity_label(activity_id)
             decoded.append(selected_activity)
-            
+
             self._append_reasoning_step(step_idx=step_idx,
                                         input_activity=input_activity,
                                         selected_activity=selected_activity,
@@ -533,10 +906,13 @@ class GuidedMode(DecisionRuleGuidedMixin, Mode):
                                         past_events=past_events,
                                         model_prob=float(masked_probs[activity_id].item()))
 
-            current_prefix = self._roll_prefix_with_activity(prefix=current_prefix,
-                                                             suffix=suffix,
-                                                             step_idx=step_idx,
-                                                             activity_id=activity_id)
+            # Predict next-event non-activity attributes from the model (no GT).
+            predicted_cat_ids, predicted_num_values = self._predict_next_event(current_prefix)
+
+            current_prefix = self._roll_prefix_with_predicted_attrs(prefix=current_prefix,
+                                                                     activity_id=activity_id,
+                                                                     predicted_cat_ids=predicted_cat_ids,
+                                                                     predicted_num_values=predicted_num_values)
 
             next_event_attrs = self._decode_event_attrs_from_prefix_last(current_prefix)
             next_event_attrs.update(self._extract_static_attrs(static_inputs))
@@ -648,8 +1024,8 @@ class GuidedMCSA(DecisionRuleGuidedMixin, MCSA):
             if input_activity:
                 decision_context = self._get_decision_context(input_activity, past_events)
                 if decision_context is not None:
-                    _, z_i, c_i = decision_context
-                    masked_probs = self._masked_distribution(base_probs, z_i, c_i, step_idx)
+                    _, z_i, _ = decision_context
+                    masked_probs = self._masked_distribution(base_probs, z_i, step_idx)
 
             if self.sample_argmax:
                 sampled_activity_id = int(torch.argmax(masked_probs, dim=-1).item())
@@ -672,26 +1048,36 @@ class GuidedMCSA(DecisionRuleGuidedMixin, MCSA):
             cat_predictions = self._sample_categorical_predictions(cat_means, cat_vars)
             cat_predictions[activity_key] = torch.tensor([[sampled_activity_id]], device=activity_logits.device, dtype=torch.long)
 
+            num_means_dict = prediction[0][1] if len(prediction[0]) > 1 else {}
+            num_vars_dict = prediction[1][1] if len(prediction[1]) > 1 else {}
+            num_predictions = self._sample_numerical_predictions(num_means_dict, num_vars_dict)
+
             if include_model_states:
                 model_states.append((h, c))
 
-            if suffix is not None:
-                next_event_attrs = self._decode_event_attrs_from_suffix_step(suffix=suffix,
-                                                                             step_idx=step_idx,
-                                                                             activity_id=sampled_activity_id,
-                                                                             static_inputs=static_inputs)
-            else:
-                predicted_ids: Dict[str, int] = {}
-                for key, value in cat_predictions.items():
-                    feature_name = key[:-5] if key.endswith("_mean") else key
-                    predicted_ids[feature_name] = int(value.item())
+            # Build decision-context features from the model-predicted attributes
+            # (and carry-forward from the last prefix event where no prediction
+            # exists). NEVER read from `suffix` here - that would leak future GT.
+            predicted_cat_ids: Dict[str, int] = {}
+            for key, value in cat_predictions.items():
+                feature_name = key[:-5] if key.endswith("_mean") else key
+                predicted_cat_ids[feature_name] = int(value.item())
 
-                next_event_attrs = self._decode_event_attrs_from_predicted_ids(predicted_ids)
-                next_event_attrs.update(self._extract_static_attrs(static_inputs))
-                next_event_attrs = self.decision_labeler._filter_attributes(next_event_attrs)
+            predicted_num_values: Dict[str, float] = {}
+            for key, value in num_predictions.items():
+                feature_name = key[:-5] if key.endswith("_mean") else key
+                # value is a tensor; take the first scalar.
+                predicted_num_values[feature_name] = float(value.reshape(-1)[0].item())
+
+            next_event_attrs = self._decode_event_attrs_from_predicted_step(activity_id=sampled_activity_id,
+                                                                              predicted_cat_ids=predicted_cat_ids,
+                                                                              predicted_num_values=predicted_num_values,
+                                                                              prefix=prefix,
+                                                                              static_inputs=static_inputs)
             past_events.append(next_event_attrs)
 
-            next_event = (list(cat_predictions.values()), [])
+            # Feed predicted attributes back into the decoder (no GT).
+            next_event = (list(cat_predictions.values()), list(num_predictions.values()))
 
             if self.variational_dropout_sampling:
                 prediction, (h, c) = self.model.inference(last_event=next_event, hx=(h, c), z=z)
@@ -767,7 +1153,7 @@ class GuidedMCSA(DecisionRuleGuidedMixin, MCSA):
 class GuidedBeam(DecisionRuleGuidedMixin, Beam):
     """
     Decision-rule-guided beam search with beam-local decision contexts.
-    Taymouri GAN LSTM
+    GAN LSTM
     """
     def __init__(self,
                  model,
@@ -826,8 +1212,8 @@ class GuidedBeam(DecisionRuleGuidedMixin, Beam):
                 if input_activity:
                     decision_context = self._get_decision_context(input_activity, beam["past_events"])
                     if decision_context is not None:
-                        _, z_i, c_i = decision_context
-                        masked_probs = self._masked_distribution(probs, z_i, c_i, step_idx)
+                        _, z_i, _ = decision_context
+                        masked_probs = self._masked_distribution(probs, z_i, step_idx)
 
                 topk_logp, topk_idx = torch.topk(torch.log(masked_probs + 1e-12), k=min(self.beam_width, masked_probs.shape[-1]))
                 for j in range(topk_idx.shape[0]):
@@ -851,32 +1237,47 @@ class GuidedBeam(DecisionRuleGuidedMixin, Beam):
                             sorted_decisions = sorted(z_i.items(), key=lambda kv: float(kv[1]), reverse=True)
                             top_decision_event = str(sorted_decisions[0][0]) if len(sorted_decisions) > 0 else None
                             top_decision_prob = float(sorted_decisions[0][1]) if len(sorted_decisions) > 0 else None
+                            is_non_trivial = len(supported) >= 2
                             new_decision_steps += 1
                             if conflict:
                                 new_conflicts += 1
 
                             guard = None
                             attribute_checks: List[Dict[str, Any]] = []
-                            explanation_status = "conflict_not_supported" if conflict else "no_matching_rule"
+                            explanation_status = "conflict_not_supported"
                             explained = False
+                            branch_has_rule = False
                             if not conflict:
+                                branch_has_rule = self._branch_has_conditioned_rule(place_name, selected_activity)
                                 guard = self._best_matching_guard(place_name, selected_activity, new_past_events)
-                                if guard is not None:
+                                matched_with_conditions = (guard is not None
+                                                           and self._guard_has_conditions(guard))
+                                if matched_with_conditions:
                                     feature_row = self.decision_labeler._build_feature_row(new_past_events)
                                     attribute_checks = self._build_attribute_checks(feature_row, guard)
+                                if matched_with_conditions and len(attribute_checks) > 0:
                                     explained = True
                                     explanation_status = "explained"
+                                elif branch_has_rule:
+                                    explanation_status = "rule_unmatched"
+                                elif guard is not None:
+                                    explanation_status = "matched_trivial_rule"
+                                else:
+                                    explanation_status = "no_rule_for_branch"
 
                             new_reasoning.append({"step": int(step_idx),
                                                   "place": place_name,
                                                   "input_event": str(input_activity),
                                                   "next_event": str(selected_activity),
+                                                  "model_prob": float(masked_probs[tok].item()),
                                                   "confidence": float(c_i),
                                                   "decision_top_event": top_decision_event,
                                                   "decision_top_prob": top_decision_prob,
                                                   "supported_set": [str(a) for a in supported],
+                                                  "is_non_trivial": bool(is_non_trivial),
                                                   "conflict": bool(conflict),
                                                   "explained": bool(explained),
+                                                  "branch_has_rule": bool(branch_has_rule),
                                                   "explanation_status": str(explanation_status),
                                                   "decision_distribution": {k: float(v) for k, v in z_i.items()},
                                                   "attribute_checks": attribute_checks,
@@ -887,11 +1288,16 @@ class GuidedBeam(DecisionRuleGuidedMixin, Beam):
                                                                                               "score": float(guard.get("score", 0.0))},
                                                   })
 
-                        new_prefix = self._roll_prefix_with_activity_from_suffix(
+                        # Predict next-event non-activity attributes from the model
+                        # (no GT). For models without a multi-head decoder we
+                        # fall back to carry-forward of the last prefix value.
+                        predicted_cat_ids, predicted_num_values = self._predict_next_event(beam["prefix"])
+
+                        new_prefix = self._roll_prefix_with_predicted_attrs(
                             prefix=beam["prefix"],
-                            suffix=suffix,
-                            step_idx=step_idx,
                             activity_id=tok,
+                            predicted_cat_ids=predicted_cat_ids,
+                            predicted_num_values=predicted_num_values,
                         )
                         next_attrs = self._decode_event_attrs_from_prefix_last(new_prefix)
                         next_attrs.update(static_attrs)
@@ -931,12 +1337,48 @@ class GuidedBeam(DecisionRuleGuidedMixin, Beam):
             explained_rate = 0.0
             if b["decision_steps"] > 0:
                 explained_rate = float(explained_steps) / float(b["decision_steps"])
-            
+            non_trivial_decision_steps = sum(1 for r in b["reasoning"] if bool(r.get("is_non_trivial", False)))
+            non_trivial_explained_steps = sum(1 for r in b["reasoning"]
+                                              if bool(r.get("is_non_trivial", False))
+                                              and bool(r.get("explained", False)))
+            non_trivial_explained_rate = 0.0
+            if non_trivial_decision_steps > 0:
+                non_trivial_explained_rate = float(non_trivial_explained_steps) / float(non_trivial_decision_steps)
+            trivial_decision_steps = int(b["decision_steps"]) - int(non_trivial_decision_steps)
+
+            def _count(status):
+                return sum(1 for r in b["reasoning"] if r.get("explanation_status") == status)
+
+            matched_trivial_rule = _count("matched_trivial_rule")
+            rule_unmatched = _count("rule_unmatched")
+            no_rule_for_branch = _count("no_rule_for_branch")
+            conflict_not_supported = _count("conflict_not_supported")
+            no_matching_rule = rule_unmatched + no_rule_for_branch
+
+            # Non-conflicting steps whose chosen branch has a data-aware rule.
+            explainable_decision_steps = sum(1 for r in b["reasoning"]
+                                             if not bool(r.get("conflict", False))
+                                             and bool(r.get("branch_has_rule", False)))
+            rule_explained_rate = 0.0
+            if explainable_decision_steps > 0:
+                rule_explained_rate = float(explained_steps) / float(explainable_decision_steps)
+
             reasoning_beams.append({"decision_steps": int(b["decision_steps"]),
                                     "conflicts": int(b["conflicts"]),
                                     "conflict_rate": float(rate),
                                     "explained_steps": int(explained_steps),
                                     "explained_rate": float(explained_rate),
+                                    "explainable_decision_steps": int(explainable_decision_steps),
+                                    "rule_explained_rate": float(rule_explained_rate),
+                                    "non_trivial_decision_steps": int(non_trivial_decision_steps),
+                                    "non_trivial_explained_steps": int(non_trivial_explained_steps),
+                                    "non_trivial_explained_rate": float(non_trivial_explained_rate),
+                                    "trivial_decision_steps": int(trivial_decision_steps),
+                                    "matched_trivial_rule": int(matched_trivial_rule),
+                                    "rule_unmatched": int(rule_unmatched),
+                                    "no_rule_for_branch": int(no_rule_for_branch),
+                                    "no_matching_rule": int(no_matching_rule),
+                                    "conflict_not_supported": int(conflict_not_supported),
                                     "trace": b["reasoning"],
                                     "beam_logprob": float(b["score"])
                                     })

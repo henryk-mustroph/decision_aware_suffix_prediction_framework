@@ -182,3 +182,117 @@ def average_dls(results_df: pd.DataFrame) -> float:
     if len(results_df) == 0:
         return 0.0
     return float(results_df["dls"].mean())
+
+
+# ---------------------------------------------------------------------------
+# Coherent / incoherent accuracy (Xu et al., 2018, Tables 4-5)
+#
+# DLS is an *incoherent*-style metric (per-token edit similarity). The semantic
+# loss is documented to slightly reduce incoherent accuracy while improving the
+# *coherent* / *constraint* metrics. These functions add the two missing
+# columns so the trade-off is observable:
+#   - exact_match : whole predicted suffix equals the target ("coherent").
+#   - token_acc   : positional token agreement ("incoherent"), denominator =
+#                   max(len) so length errors are penalised.
+# Sequences are scored exactly as DLS sees them (no extra EOS truncation), so
+# the columns line up case-for-case with the DLS DataFrame.
+# ---------------------------------------------------------------------------
+def exact_match_score(target_seq: list, predicted_seq: list) -> float:
+    """1.0 iff the predicted activity suffix equals the target suffix."""
+    return 1.0 if list(target_seq) == list(predicted_seq) else 0.0
+
+
+def token_level_accuracy(target_seq: list, predicted_seq: list) -> float:
+    """Positional token agreement; denominator = max length (penalises length errors)."""
+    denom = max(len(target_seq), len(predicted_seq), 1)
+    correct = sum(1 for a, b in zip(target_seq, predicted_seq) if a == b)
+    return correct / denom
+
+
+def _coherence_row(row: dict, reduction: ProbReduction = "mean") -> dict:
+    target = row.get("target_suffix", [])
+    decoded = row.get("decoded_suffixes", []) or [[]]
+
+    if "probabilistic" in str(row.get("mode", "")).lower():
+        ems = [exact_match_score(target, seq) for seq in decoded]
+        tas = [token_level_accuracy(target, seq) for seq in decoded]
+        if reduction == "best":
+            em, ta = max(ems), max(tas)
+        else:
+            em, ta = sum(ems) / len(ems), sum(tas) / len(tas)
+    else:
+        pred = decoded[0] if len(decoded) > 0 else []
+        em = exact_match_score(target, pred)
+        ta = token_level_accuracy(target, pred)
+
+    return {"case_id": row.get("case_id"),
+            "prefix_len": int(row.get("prefix_len", 0)),
+            "exact_match": float(em),
+            "token_acc": float(ta),
+            "mode": row.get("mode", "")}
+
+
+def evaluate_coherence(outputs: list[dict],
+                       probabilistic_reduction: ProbReduction = "mean") -> pd.DataFrame:
+    """
+    Coherent (exact-match) and incoherent (token-level) accuracy per row.
+
+    Columns: case_id, prefix_len, exact_match, token_acc, mode.
+    """
+    if len(outputs) == 0:
+        return pd.DataFrame(columns=["case_id", "prefix_len", "exact_match", "token_acc", "mode"])
+    return pd.DataFrame([_coherence_row(row, probabilistic_reduction) for row in outputs])
+
+
+def average_coherence(coherence_df: pd.DataFrame) -> dict:
+    """Overall coherent (exact_match) and incoherent (token_acc) accuracy."""
+    if len(coherence_df) == 0:
+        return {"exact_match": 0.0, "token_acc": 0.0}
+    return {"exact_match": float(coherence_df["exact_match"].mean()),
+            "token_acc": float(coherence_df["token_acc"].mean())}
+
+
+# ---------------------------------------------------------------------------
+# Decision-constraint conformance (Xu et al., 2018, "Constraint" column)
+#
+# The semantic loss optimises decision conformance, not DLS. This is the metric
+# that should move when decision-aware training works: the fraction of
+# decision-labeled decoder steps whose decoded activity lies in the tau-support
+#   S = { a | z(a) >= tau }
+# of the decision model. Per-step conflict bookkeeping is produced by the
+# decision-rule-guided evaluator (see experiments.evaluation.evaluate_conformance,
+# which runs it with guidance disabled so the decode stays the model's own).
+# ---------------------------------------------------------------------------
+def decision_conformance_rate(decision_steps: int, conflicts: int) -> float:
+    """conformance = 1 - conflicts / decision_steps; NaN when no decision steps."""
+    ds = int(decision_steps)
+    if ds <= 0:
+        return float("nan")
+    return 1.0 - float(conflicts) / float(ds)
+
+
+def aggregate_decision_conformance(reasoning_rows: list[dict]) -> dict:
+    """
+    Aggregate decision conformance over per-case reasoning rows.
+
+    Each row may carry a ``reasonings`` list of per-decode dicts (the format
+    emitted by experiments.evaluation), or be a single reasoning dict. Both
+    cases must expose ``decision_steps`` and ``conflicts`` counters.
+
+    Returns: decision_steps, conflicts, conflict_rate, decision_conformance.
+    """
+    decision_steps = 0
+    conflicts = 0
+    for row in reasoning_rows:
+        reasonings = row.get("reasonings") if isinstance(row, dict) else None
+        if reasonings is None:
+            reasonings = [row]
+        for r in reasonings:
+            decision_steps += int(r.get("decision_steps", 0))
+            conflicts += int(r.get("conflicts", 0))
+
+    conflict_rate = (conflicts / decision_steps) if decision_steps else 0.0
+    return {"decision_steps": decision_steps,
+            "conflicts": conflicts,
+            "conflict_rate": float(conflict_rate),
+            "decision_conformance": decision_conformance_rate(decision_steps, conflicts)}

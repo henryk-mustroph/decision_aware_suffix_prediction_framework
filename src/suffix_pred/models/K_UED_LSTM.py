@@ -205,10 +205,8 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
         print("Input feature size decoder: ", self.input_size_dec)
 
         # Dictionary of output features and output_sizes
+        # Multi-head setup: predict both categorical and numerical dynamic event attributes.
         self.output_sizes = self.__get_list_dict_labels_output(data_set_categories=data_set_categories, model_type_feats=dec_feat)
-        
-        # Categorical-only setup: keep only categorical output heads
-        self.output_sizes[1] = {}
         print("Output feature list of dicts (featue name, feature output size)"
               " of decoder:",
              self.output_sizes,)
@@ -225,9 +223,6 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
 
         # List containing two dicts: One for categorical, one for numerical
         self.output_feature_indeces = self.__get_list_dict_feature_index(data_set_categories=data_set_categories, model_type_feats=dec_feat)
-        
-        # Categorical-only setup: keep only categorical output indices
-        self.output_feature_indeces[1] = {}
 
     def __get_list_labels_input(self, data_set_categories, model_type_feats):
         """
@@ -353,12 +348,15 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
         sos_event = [cat_sos_events, num_sos_events]
 
         # output_sizes is a list of two dicts: [cat_dict, num_dict]
-        cat_output_features_labels, _ = self.output_sizes
-        # Prediction dictionary for categorical features
+        cat_output_features_labels, num_output_features_labels = self.output_sizes
+        # Prediction dictionary for categorical and numerical features
         cat_predictions = {f"{key}_{suffix}": None
                            for key in cat_output_features_labels
                            for suffix in ["mean", "var"]}
-        predictions = [cat_predictions, {}]
+        num_predictions = {f"{key}_{suffix}": None
+                           for key in num_output_features_labels
+                           for suffix in ["mean", "var"]}
+        predictions = [cat_predictions, num_predictions]
 
         # Training
         if training:
@@ -401,8 +399,8 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
                         preds, (h, c), _ = self.decoder(input=last_pred_event, hx=(h, c), z=z, pred=True)
                         pred_means, pred_vars = preds
 
-                cat_pred_means, _ = pred_means
-                cat_pred_vars, _ = pred_vars
+                cat_pred_means, num_pred_means = pred_means
+                cat_pred_vars, num_pred_vars = pred_vars
 
                 # Add categorical tensors to output
                 for key in cat_output_features_labels:
@@ -412,6 +410,15 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
                     else:
                         predictions[0][f"{key}_mean"] = torch.cat((predictions[0][f"{key}_mean"], cat_pred_means[f"{key}_mean"].unsqueeze(0)),dim=0)
                         predictions[0][f"{key}_var"] = torch.cat((predictions[0][f"{key}_var"], cat_pred_vars[f"{key}_var"].unsqueeze(0)), dim=0)
+
+                # Add numerical tensors to output
+                for key in num_output_features_labels:
+                    if t == 0:
+                        predictions[1][f"{key}_mean"] = num_pred_means[f"{key}_mean"].unsqueeze(0)
+                        predictions[1][f"{key}_var"] = num_pred_vars[f"{key}_var"].unsqueeze(0)
+                    else:
+                        predictions[1][f"{key}_mean"] = torch.cat((predictions[1][f"{key}_mean"], num_pred_means[f"{key}_mean"].unsqueeze(0)), dim=0)
+                        predictions[1][f"{key}_var"] = torch.cat((predictions[1][f"{key}_var"], num_pred_vars[f"{key}_var"].unsqueeze(0)), dim=0)
 
         # Validation:
         if validation:
@@ -424,8 +431,8 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
                     preds, (h, c), z = self.decoder(input=last_pred_event, hx=(h, c), z=z, pred=True)
                     pred_means, pred_vars = preds
 
-                cat_pred_means, _ = pred_means
-                cat_pred_vars, _ = pred_vars
+                cat_pred_means, num_pred_means = pred_means
+                cat_pred_vars, num_pred_vars = pred_vars
 
                 # Add categorical tensors to output
                 for key in cat_output_features_labels:
@@ -439,6 +446,15 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
                         predictions[0][f"{key}_var"] = torch.cat((predictions[0][f"{key}_var"], cat_pred_vars[f"{key}_var"].unsqueeze(0)),
                                                                  dim=0)
 
+                # Add numerical tensors to output
+                for key in num_output_features_labels:
+                    if k == 0:
+                        predictions[1][f"{key}_mean"] = num_pred_means[f"{key}_mean"].unsqueeze(0)
+                        predictions[1][f"{key}_var"] = num_pred_vars[f"{key}_var"].unsqueeze(0)
+                    else:
+                        predictions[1][f"{key}_mean"] = torch.cat((predictions[1][f"{key}_mean"], num_pred_means[f"{key}_mean"].unsqueeze(0)), dim=0)
+                        predictions[1][f"{key}_var"] = torch.cat((predictions[1][f"{key}_var"], num_pred_vars[f"{key}_var"].unsqueeze(0)), dim=0)
+
         # Return training or validation output
         if training and return_teacher_forcing_mask:
             return predictions, (h, c), self.seq_len_pred, self.output_feature_indeces, tf_mask
@@ -451,28 +467,38 @@ class DropoutUncertaintyEncoderDecoderLSTM(nn.Module):
                                          suffix: Optional[list] = None):
         """
         Transform predictions into next event for decoder input.
-        
+
         Inputs:
-        - pred_means: predicted values
-        - pred_index: index of event for next prediction
-        - suffix: Target data
+        - pred_means: predicted values (cat dict, num dict)
+        - pred_index: index of event for next prediction (unused; kept for backwards compatibility)
+        - suffix: Target data (unused; kept for backwards compatibility - using GT suffix here would leak future information at inference)
 
         Outputs:
         - next_event: event in decoder input data format
         """
-        cat_pred_means, _ = pred_means
+        cat_pred_means, num_pred_means = pred_means
 
-        # Create index tensor based on predicted logits
+        # Categorical: argmax over class logits
         cat_preds = [torch.argmax(tensor, dim=1).unsqueeze(1) for _, tensor in enumerate(cat_pred_means.values())]
 
-        # Keep continuous decoder inputs even though they are not predicted as outputs.
-        if suffix is not None and pred_index is not None and pred_index > 0:
-            _, num_suffix = suffix
-            num_events = [num_suffix[i][:, pred_index - 1 : pred_index] for i in self.data_indices_dec[1]]
-        else:
-            first_cat_tensor = next(iter(cat_pred_means.values()))
-            batch_size = first_cat_tensor.shape[0]
-            num_events = [torch.zeros(batch_size, 1, device=first_cat_tensor.device) for _ in self.data_indices_dec[1]]
+        # Numerical: feed predicted means back autoregressively.
+        # Reorder by data_indices_dec[1] (dataset-order) using num_categories names.
+        first_cat_tensor = next(iter(cat_pred_means.values()))
+        batch_size = first_cat_tensor.shape[0]
+        device = first_cat_tensor.device
+
+        num_pred_by_name = {key[: -len("_mean")]: tensor for key, tensor in num_pred_means.items() if key.endswith("_mean")}
+        num_categories = self.data_set_categories[1]
+
+        num_events = []
+        for i in self.data_indices_dec[1]:
+            feat_name = num_categories[i][0]
+            pred_tensor = num_pred_by_name.get(feat_name, None)
+            if pred_tensor is None:
+                num_events.append(torch.zeros(batch_size, 1, device=device))
+            else:
+                # pred_tensor: [B, 1]; ensure shape matches expected decoder input.
+                num_events.append(pred_tensor.detach() if pred_tensor.requires_grad else pred_tensor)
 
         last_event = [cat_preds, num_events]
 
@@ -608,8 +634,8 @@ class DropoutUncertaintyLSTMDecoder(nn.Module):
         self.output_sizes = output_sizes
 
         # Output_sizes is a list containing two dicts:
-        # one for categorical features and one (possibly empty) numerical features
-        cat_output_sizes, _ = output_sizes
+        # one for categorical features and one for numerical features
+        cat_output_sizes, num_output_sizes = output_sizes
 
         # Create a ModuleDict to hold the layers
         self.output_layers = nn.ModuleDict()
@@ -618,6 +644,10 @@ class DropoutUncertaintyLSTMDecoder(nn.Module):
         for key, size in cat_output_sizes.items():
             self.output_layers[f"{key}_mean"] = nn.Linear(hidden_size, size)
             self.output_layers[f"{key}_var"] = nn.Linear(hidden_size, size)
+        # And for numerical features (scalar per feature: mean and log-variance).
+        for key in num_output_sizes:
+            self.output_layers[f"{key}_mean"] = nn.Linear(hidden_size, 1)
+            self.output_layers[f"{key}_var"] = nn.Linear(hidden_size, 1)
 
     def regularizer(self):
         """
@@ -734,7 +764,7 @@ class DropoutUncertaintyLSTMDecoder(nn.Module):
         final_output = outputs[-1]
 
         # Unpack output_sizes into categorical and numerical dicts
-        cat_output_sizes, _ = self.output_sizes
+        cat_output_sizes, num_output_sizes = self.output_sizes
 
         # Predict means and variances for categorical features
         for key in cat_output_sizes:
@@ -747,6 +777,14 @@ class DropoutUncertaintyLSTMDecoder(nn.Module):
             prediction_vars[0][f"{key}_var"] = (
                 pred_var  # Store in the first dict (for cat features)
             )
+
+        # Predict means and log-variances for numerical features.
+        for key in num_output_sizes:
+            pred_mean = self.output_layers[f"{key}_mean"](final_output)
+            prediction_means[1][f"{key}_mean"] = pred_mean
+
+            pred_var = self.output_layers[f"{key}_var"](final_output)
+            prediction_vars[1][f"{key}_var"] = pred_var
 
         predictions = [prediction_means, prediction_vars]
 

@@ -33,10 +33,17 @@ class InductiveMiner:
         ev_log = log_converter.apply(df, variant=log_converter.Variants.TO_EVENT_LOG, parameters=params)
         return df, ev_log
 
-    def discover_petri_net(self, visulaize: bool=True, store_loc_file_path:Optional[str]=None, case_ids: Optional[list] = None):
+    def discover_petri_net(self,
+                           visulaize: bool=True,
+                           store_loc_file_path:Optional[str]=None,
+                           case_ids: Optional[list] = None,
+                           noise_threshold: float = 0):
+        
         _, event_log = self._create_event_log(case_ids=case_ids)
+        
         net, initial_marking, final_marking = pm4py.discover_petri_net_inductive(event_log,
-                                                                                 multi_processing=False)
+                                                                                 multi_processing=False,
+                                                                                 noise_threshold=noise_threshold)
     
         if visulaize:
             gviz = pn_visualizer.apply(net, initial_marking, final_marking)

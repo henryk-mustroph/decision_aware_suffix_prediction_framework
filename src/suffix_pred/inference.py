@@ -126,6 +126,39 @@ class Decoder:
 
         return sampled_predictions
 
+    def _sample_numerical_predictions(self, num_means, num_variances):
+        """
+        Sample one scalar per numerical feature from Gaussian (mean, exp(logvar)).
+        Returns dict {feature_name_mean: tensor[B, 1]}.
+        """
+        sampled_predictions = {}
+        for key in num_means.keys():
+            if not key.endswith("_mean"):
+                continue
+
+            feature_name = key[: -len("_mean")]
+            mean = num_means[key]
+
+            if self.sample_argmax:
+                sampled = mean
+            else:
+                var_key = f"{feature_name}_var"
+                if var_key in num_variances:
+                    logvar = torch.clamp(num_variances[var_key], min=-6.0, max=6.0)
+                    std = torch.exp(0.5 * logvar)
+                    sampled = torch.normal(mean, std)
+                else:
+                    sampled = mean
+
+            # Expected shape for decoder input: [B, 1]
+            if sampled.dim() == 3 and sampled.shape[-1] == 1:
+                sampled = sampled.squeeze(-1)
+            if sampled.dim() == 1:
+                sampled = sampled.unsqueeze(-1)
+            sampled_predictions[f"{feature_name}_mean"] = sampled
+
+        return sampled_predictions
+
     def _activity_label(self, activity_id: int):
         return self._activity_id_to_label.get(activity_id, None)
 
@@ -212,6 +245,7 @@ class MCSA(Decoder):
         i = 0
         while i <= max_iteration:
             cat_predictions = self._sample_categorical_predictions(prediction[0][0], prediction[1][0])
+            num_predictions = self._sample_numerical_predictions(prediction[0][1], prediction[1][1])
 
             activity_key = f"{self.concept_name}_mean"
             if activity_key not in cat_predictions:
@@ -227,8 +261,8 @@ class MCSA(Decoder):
             if include_model_states:
                 model_states.append((h, c))
 
-            # Keep numeric inputs empty: model handles fallback if required.
-            next_event = (list(cat_predictions.values()), [])
+            # Feed predicted numerical values back autoregressively (no GT leakage).
+            next_event = (list(cat_predictions.values()), list(num_predictions.values()))
 
             if self.variational_dropout_sampling:
                 prediction, (h, c) = self.model.inference(last_event=next_event,
@@ -346,9 +380,24 @@ class Mode(Decoder):
         selected_nums = [prefix_nums[i] for i in self._num_feature_indices]
         return (selected_cats, selected_nums)
 
-    def _roll_prefix_with_activity(self, prefix, suffix, step_idx: int, activity_id: int):
+    def _roll_prefix_with_predicted_attrs(self, prefix, activity_id: int,
+                                          predicted_cat_ids=None,
+                                          predicted_num_values=None):
+        """
+        Roll prefix forward by one step. Non-activity attributes are taken from
+        predicted values where available; otherwise we carry forward the last
+        observed value (no GT-suffix leakage at inference time).
+
+        Inputs:
+        - predicted_cat_ids: dict {feature_name: int} for non-activity categorical
+        - predicted_num_values: dict {feature_name: float} for numerical
+        """
         prefix_cats, prefix_nums = prefix
-        suffix_cats, suffix_nums = suffix
+        predicted_cat_ids = predicted_cat_ids or {}
+        predicted_num_values = predicted_num_values or {}
+
+        dataset_cat_names = [cat[0] for cat in self.dataset.all_categories[0]]
+        dataset_num_names = [num[0] for num in self.dataset.all_categories[1]]
 
         new_cats = []
         for i, cat in enumerate(prefix_cats):
@@ -356,24 +405,51 @@ class Mode(Decoder):
             if i == self.concept_name_id:
                 shifted[:, -1] = activity_id
             else:
-                if step_idx < suffix_cats[i].shape[1]:
-                    shifted[:, -1] = suffix_cats[i][:, step_idx]
+                feat_name = dataset_cat_names[i] if i < len(dataset_cat_names) else None
+                if feat_name is not None and feat_name in predicted_cat_ids:
+                    shifted[:, -1] = int(predicted_cat_ids[feat_name])
                 else:
-                    shifted[:, -1] = 0
+                    # Carry forward the last known value.
+                    shifted[:, -1] = cat[:, -1]
             new_cats.append(shifted)
 
         new_nums = []
         for i, num in enumerate(prefix_nums):
             shifted = torch.roll(num.clone(), shifts=-1, dims=1)
-            if step_idx < suffix_nums[i].shape[1]:
-                shifted[:, -1] = suffix_nums[i][:, step_idx]
+            feat_name = dataset_num_names[i] if i < len(dataset_num_names) else None
+            if feat_name is not None and feat_name in predicted_num_values:
+                shifted[:, -1] = float(predicted_num_values[feat_name])
             else:
                 shifted[:, -1] = num[:, -1]
             new_nums.append(shifted)
 
         return (new_cats, new_nums)
 
+    # Backwards-compatible alias used by guided decoders that still pass `suffix`.
+    # The suffix argument is intentionally ignored to prevent GT leakage.
+    def _roll_prefix_with_activity(self, prefix, suffix, step_idx: int, activity_id: int,
+                                   predicted_cat_ids=None, predicted_num_values=None):
+        return self._roll_prefix_with_predicted_attrs(prefix=prefix,
+                                                       activity_id=activity_id,
+                                                       predicted_cat_ids=predicted_cat_ids,
+                                                       predicted_num_values=predicted_num_values)
+
+    def _predict_next_event(self, current_prefix):
+        """
+        Use the model's `predict_next_event` helper if available to obtain
+        next-event dynamic-attribute predictions. Returns (cat_ids, num_values) dicts.
+        """
+        if hasattr(self.model, "predict_next_event") and callable(self.model.predict_next_event):
+            model_prefix = self._project_prefix_for_model(current_prefix)
+            preds = self.model.predict_next_event(model_prefix)
+            cat_ids = {feat: int(t.item()) for feat, t in preds.get("cat_ids", {}).items()}
+            num_values = {feat: float(t.item()) for feat, t in preds.get("num_values", {}).items()}
+            return cat_ids, num_values
+        return {}, {}
+
     def decode_suffix(self, prefix, suffix, prefix_len):
+        # suffix is accepted for API parity but never read - using it would
+        # leak future ground-truth attributes into autoregressive decoding.
         max_iteration = (self.dataset.encoder_decoder.window_size - self.dataset.encoder_decoder.min_suffix_size - prefix_len)
 
         current_prefix = ([t.clone() for t in prefix[0]], [t.clone() for t in prefix[1]])
@@ -388,12 +464,14 @@ class Mode(Decoder):
                 break
 
             decoded.append(self._activity_label(activity_id))
-            
-            # no teacher forcing for camargo: Add predicted event label to prefix.
-            current_prefix = self._roll_prefix_with_activity(prefix=current_prefix,
-                                                             suffix=suffix,
-                                                             step_idx=step_idx,
-                                                             activity_id=activity_id)
+
+            # Predict next-event non-activity attributes from the model and use
+            # them to roll the prefix forward (no GT leakage).
+            cat_ids, num_values = self._predict_next_event(current_prefix)
+            current_prefix = self._roll_prefix_with_predicted_attrs(prefix=current_prefix,
+                                                                     activity_id=activity_id,
+                                                                     predicted_cat_ids=cat_ids,
+                                                                     predicted_num_values=num_values)
 
         return decoded
 
@@ -408,7 +486,7 @@ class Mode(Decoder):
                 prefix_activity = self._decode_activity_prefix(prefix)
                 target_suffix = self._decode_activity_suffix(suffix)
                 decoded_suffixes = [self.decode_suffix(prefix=prefix, suffix=suffix, prefix_len=prefix_len)]
-                
+
                 yield (case_name,
                        prefix_len,
                        prefix_activity,

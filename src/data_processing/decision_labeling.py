@@ -1,9 +1,16 @@
 """
-Decision-aware event labeling for suffix prediction. Implements the labeling described in the paper:
+Decision-aware event labeling for suffix prediction.
 
-Two modes:
-- Offline (training): uses optimal alignments from decision mining.
-- Online (inference): map event to transition to place.
+For each visible event in a trace we attach a pair ``(p_i, z_i)``:
+    p_i  -- the decision place reached by the event (sentinel ``BOTTOM`` if
+            the event does not enable a decision place).
+    z_i  -- the decision model's probability distribution over the activities
+            that can directly follow at p_i (empty when p_i == BOTTOM).
+
+Labeling is done offline from optimal alignments produced by the decision
+miner; the runtime online use of the same decision models during
+autoregressive decoding lives in
+``suffix_pred.decision_rule_guided_reasoning_inference``.
 """
 from __future__ import annotations
 
@@ -14,6 +21,8 @@ import pandas as pd
 import pickle
 import json
 from pathlib import Path
+
+from decision_mining.decision_discovery import replay_alignment_decisions
 
 _MODULE_RENAMES = {"decision_mining.custom_framework.decision_discovery": "decision_mining.decision_discovery",
                    "decision_mining.custom_framework.function_estimator_catboost_advanced": "decision_mining.function_estimator_catboost_advanced"}
@@ -50,7 +59,7 @@ def _load_estimator_artifact(obj: Any) -> Any:
     return obj
 
 
-# Sentinel for non-decision events
+# Sentinel for non-decision events.
 BOTTOM = "⊥"
 
 
@@ -69,14 +78,37 @@ class DecisionLabeler:
                  decision_model_dir: str,
                  decision_places_bundle_path: str,
                  dynamic_attributes: Optional[List[str]] = None,
-                 static_attributes: Optional[List[str]] = None) -> None:
-        
+                 static_attributes: Optional[List[str]] = None,
+                 numeric_scalers: Optional[Dict[str, Any]] = None) -> None:
+        """
+        numeric_scalers: optional mapping ``column_name -> fitted sklearn-style
+        transformer``. Applied to numeric columns of the event log during
+        offline labeling so the test-time feature space matches the one the
+        decision miner trained on (which itself matches the LSTM's scaled
+        runtime features). If not provided, the labeler attempts to load a
+        sibling ``numeric_scalers.pkl`` next to the bundle JSON; pass an
+        explicit empty dict to disable auto-loading.
+        """
+
 
         self.net, self.im, self.fm = petri_net
 
         self.dynamic_attributes = list(dynamic_attributes or [])
         self.static_attributes = list(static_attributes or [])
         self.past_attr_keys = self.dynamic_attributes + self.static_attributes
+
+        # Resolve numeric scalers: explicit argument wins; otherwise auto-load
+        # a sibling pickle saved by DecisionDiscovery.save_results.
+        if numeric_scalers is None:
+            scaler_candidate = Path(decision_places_bundle_path).parent / "numeric_scalers.pkl"
+            if scaler_candidate.exists():
+                with open(scaler_candidate, "rb") as f:
+                    loaded_scalers = pickle.load(f)
+                self.numeric_scalers: Dict[str, Any] = dict(loaded_scalers or {})
+            else:
+                self.numeric_scalers = {}
+        else:
+            self.numeric_scalers = dict(numeric_scalers or {})
 
         # transition lookup
         self.transition_by_name: Dict[str, Any] = {str(t.name): t for t in self.net.transitions}
@@ -101,7 +133,7 @@ class DecisionLabeler:
             model_path_str = entry.get("model_path", "")
             if not model_path_str:
                 continue
-            
+
             # Prioritise decision_model_dir
             model_filename = Path(model_path_str).name
             candidate = model_dir / model_filename
@@ -114,17 +146,31 @@ class DecisionLabeler:
                 model_path = Path(model_path_str)
                 if not model_path.is_absolute():
                     model_path = (Path(decision_places_bundle_path).parent / model_path_str)
-            
+
             if model_path.exists():
                 with open(model_path, "rb") as f:
                     loaded = _compat_unpickle(f)
                     self.estimators[place_name] = _load_estimator_artifact(loaded)
 
-        # Rich labeling records for inspection/debugging.
-        # Offline: case_id -> list of records (one per synchronized event)
-        self.last_offline_label_records: Dict[str, List[Dict[str, Any]]] = {}
-        # Online: list of records (one per prefix event)
-        self.last_online_label_records: List[Dict[str, Any]] = []
+    def _apply_numeric_scalers_to_df(self, df: pd.DataFrame) -> None:
+        """
+        Transform numeric columns of ``df`` in-place with the persisted
+        scalers. Mirrors DecisionDiscovery._apply_numeric_scalers.
+        """
+        if not self.numeric_scalers:
+            return
+        for col, scaler in self.numeric_scalers.items():
+            if col not in df.columns:
+                continue
+            series = pd.to_numeric(df[col], errors="coerce")
+            mask = series.notna()
+            if not mask.any():
+                continue
+            reshaped = series[mask].to_numpy().reshape(-1, 1)
+            transformed = np.asarray(scaler.transform(reshaped)).reshape(-1)
+            new_values = series.astype(float).copy()
+            new_values.loc[mask] = transformed
+            df[col] = new_values
 
     # Feature-row building: same as DecisionDiscovery._build_feature_row and _filter_attributes
     def _filter_attributes(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
@@ -142,78 +188,83 @@ class DecisionLabeler:
                 out[k] = v
         return out
 
-    @staticmethod
-    def _build_feature_row(past_events: List[Dict[str, Any]]) -> Dict[str, Any]:
-        features: Dict[str, Any] = {}
-        features["past_events_count"] = float(len(past_events))
+    def _build_feature_row(self, past_events: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Mirror of DecisionDiscovery.build_feature_row.
 
+        Static attributes pass through as single columns (latest non-null
+        observation). Each dynamic attribute emits two columns:
+          - ``<attr>``           value at the most recent observed event
+                                 (position j)
+          - ``<attr>_past_avg``  mean over all past events (including j)
+                                 for numeric attributes
+          - ``<attr>_past_mode`` most-frequent value across the same set
+                                 (categorical attributes)
+        """
+        from collections import Counter
+
+        features: Dict[str, Any] = {}
         if not past_events:
             return features
 
+        static_set = set(self.static_attributes)
+        if self.dynamic_attributes:
+            allowed_dyn = set(self.dynamic_attributes)
+        else:
+            observed: set = set()
+            for ev in past_events:
+                observed.update(ev.keys())
+            allowed_dyn = observed - static_set
+
+        # Static columns: latest non-null value across past events.
+        if static_set:
+            all_keys: set = set()
+            for ev in past_events:
+                all_keys.update(ev.keys())
+            for key in sorted(all_keys & static_set):
+                latest: Any = np.nan
+                for ev in past_events:
+                    v = ev.get(key, None)
+                    if v is None:
+                        continue
+                    if isinstance(v, (float, np.floating)) and np.isnan(v):
+                        continue
+                    latest = v
+                if isinstance(latest, (int, np.integer)):
+                    latest = str(int(latest))
+                features[key] = latest
+
         previous_event = past_events[-1]
-        older_events = past_events[:-1]
-        features["older_events_count"] = float(len(older_events))
+        # Match the training-side spec: aggregate over earlier synchronous
+        # events only (r < j), excluding the most recent (at j).
+        history_events = past_events[:-1]
 
-        for key, value in previous_event.items():
-            if isinstance(value, (int, np.integer)):
-                value = str(int(value))
-            features[f"{key}_prev_event"] = value
+        for key in sorted(allowed_dyn):
+            last_val = previous_event.get(key, np.nan)
+            if isinstance(last_val, (int, np.integer)):
+                last_val = str(int(last_val))
+            features[key] = last_val
 
-        if older_events:
-            summary_keys: set = set()
-            for ev in older_events:
-                summary_keys.update(ev.keys())
-            for key in sorted(summary_keys):
-                seq = [ev.get(key, np.nan) for ev in older_events]
-                valid_vals = [v for v in seq if not (v is None or (isinstance(v, (float, np.floating)) and np.isnan(v)))]
-                features[f"{key}_older_non_null_count"] = float(len(valid_vals))
-                if not valid_vals:
-                    continue
-                if all(isinstance(v, (float, np.floating)) for v in valid_vals):
-                    arr = np.array(valid_vals, dtype=float)
-                    features[f"{key}_older_mean"] = float(np.nanmean(arr))
-                    features[f"{key}_older_std"] = float(np.nanstd(arr))
-                    features[f"{key}_older_min"] = float(np.nanmin(arr))
-                    features[f"{key}_older_max"] = float(np.nanmax(arr))
-                else:
-                    cat_vals = [str(v) for v in valid_vals]
-                    features[f"{key}_older_last"] = cat_vals[-1]
-                    features[f"{key}_older_nunique"] = float(len(set(cat_vals)))
+            # Historical summary over all sync events before j (EXCLUDING j).
+            seq = [ev.get(key, np.nan) for ev in history_events]
+            valid = [v for v in seq
+                     if v is not None and not (isinstance(v, (float, np.floating)) and np.isnan(v))]
+            is_numeric_last = (isinstance(last_val, (float, np.floating))
+                               and not (isinstance(last_val, float) and np.isnan(last_val)))
+            is_numeric_history = any(isinstance(v, (float, np.floating)) for v in valid)
+            is_numeric = is_numeric_history or (not valid and is_numeric_last)
 
-        keys: set = set()
-        for ev in past_events:
-            keys.update(ev.keys())
-
-        for key in sorted(keys):
-            seq = [ev.get(key, np.nan) for ev in past_events]
-
-            def _is_float_value(v):
-                return isinstance(v, (float, np.floating)) and not np.isnan(v)
-
-            is_continuous = any(_is_float_value(v) for v in seq)
-
-            def _as_cat(v):
-                if v is None:
-                    return np.nan
-                if isinstance(v, float) and np.isnan(v):
-                    return np.nan
-                if isinstance(v, bool):
-                    return v
-                return str(v)
-
-            def _as_num(v):
-                if isinstance(v, (float, np.floating)):
-                    return v
-                return np.nan
-
-            getv = _as_num if is_continuous else _as_cat
-
-            if len(seq) >= 1:
-                features[f"{key}_prev1"] = getv(seq[-1])
-            if len(seq) >= 2:
-                features[f"{key}_prev2"] = getv(seq[-2])
-            if len(seq) >= 3:
-                features[f"{key}_prev3"] = getv(seq[-3])
+            if is_numeric:
+                if valid:
+                    arr = np.array([float(v) for v in valid if isinstance(v, (float, np.floating))],
+                                   dtype=float)
+                    features[f"{key}_past_avg"] = float(np.mean(arr))
+            else:
+                if valid:
+                    counts = Counter(str(v) for v in valid)
+                    features[f"{key}_past_mode"] = counts.most_common(1)[0][0]
+                elif last_val is not None and not (isinstance(last_val, float) and np.isnan(last_val)):
+                    features[f"{key}_past_mode"] = str(last_val)
 
         return features
 
@@ -230,7 +281,7 @@ class DecisionLabeler:
         """
         estimator = self.estimators.get(place_name)
         if estimator is None:
-                        return {}
+            return {}
 
         feature_row = self._build_feature_row(past_events)
         labels, probs = estimator.predict_proba(feature_row)
@@ -241,26 +292,33 @@ class DecisionLabeler:
     # Offline labeling (training): uses optimal alignments
     def _places_after_transition(self, trans: Any) -> List[Any]:
         """
-        Return the decision places in t• (output places of *trans*).
+        Return the decision places in t-bullet (output places of *trans*).
         """
         return [arc.target for arc in trans.out_arcs if arc.target in self.decision_places]
 
-    def label_traces_offline(self,
-                             event_log_df: pd.DataFrame,
-                             sorted_case_ids: List[str],
-                             alignments: List[Any]) -> Dict[str, List[List[Tuple[str, List[Dict[str, Any]], Dict[str, float], float]]]]:
-        """
-        Label every event from the first decision place in t•.
-        For each visible event e_i, we inspect the output places of its aligned transition t.
-        If any place p in t• is a decision point (|p•| > 1), we query the shallow decision model at p using the data state up to and including e_i.
-        The shallow prediction returns a resolved distribution z_i over directly reachable visible event labels.
+    def _collect_sync_events(self,
+                             case: pd.DataFrame,
+                             case_alignment: List[Any]) -> List[Dict[str, Any]]:
+        """Ordered (filtered) attribute dicts, one per synchronous move."""
+        sync_events: List[Dict[str, Any]] = []
+        cursor = 0
+        for (log_name, model_name), (log_label, model_label) in case_alignment:
+            if model_name == ">>" or log_name == ">>":
+                continue
+            if self.transition_by_name.get(model_name) is None:
+                continue
+            candidate_labels = [lbl for lbl in [log_label, model_label] if lbl]
+            matched: Dict[str, Any] = {}
+            for pos in range(cursor, len(case)):
+                if case.iloc[pos].get("concept:name", None) in candidate_labels:
+                    matched = self._filter_attributes(case.iloc[pos].to_dict())
+                    cursor = pos + 1
+                    break
+            sync_events.append(matched)
+        return sync_events
 
-        Outputs:
-        dict  {case_id: list-of-event-labels}
-        - Each event label is:
-        either (p_i, A_i, z_i, c_i) for a decision event, or (BOTTOM, A_i, {}, 0.0) for a non-decision event.
-        """
-        # Pre-compute elapsed times the same way DecisionDiscovery does.
+    def _prepare_df(self, event_log_df: pd.DataFrame) -> pd.DataFrame:
+        """Add elapsed-time columns and apply numeric scalers, as the miner did."""
         df = event_log_df.copy()
         case_col = "case:concept:name"
         ts_col = "time:timestamp"
@@ -269,73 +327,111 @@ class DecisionLabeler:
             df["case_elapsed_time"] = (df[ts_col] - case_start).dt.total_seconds()
             elapsed = df.groupby(case_col)[ts_col].diff().dt.total_seconds()
             df["event_elapsed_time"] = elapsed.fillna(0.0)
+        self._apply_numeric_scalers_to_df(df)
+        return df
 
-        result: Dict[str, List[List[Tuple[str, List[Dict[str, Any]], Dict[str, float], float]]]] = {}
-        self.last_offline_label_records = {}
+    def label_traces_offline(self,
+                             event_log_df: pd.DataFrame,
+                             sorted_case_ids: List[str],
+                             alignments: List[Any]) -> Dict[str, List[Tuple[str, Dict[str, float]]]]:
+        """
+        Per visible event, the decision place that governs the *next* visible
+        event together with the decision model's distribution over the next
+        activity label.
+
+        We replay each alignment with :func:`replay_alignment_decisions` (the
+        exact routine the decision miner trained on). For the ``k``-th visible
+        event ``e_k`` we attach the decision whose branch is actually resolved
+        by the next event ``e_{k+1}`` (``resolved_by == k+1``); the proximate
+        such decision (created last) is used. This keys on the resolving event
+        rather than global event order, so a decision sitting on a *concurrent*
+        branch (resolved by a different event) is not mis-attached here. The
+        final event predicts ``EOS`` via a branch that ends the case
+        (``resolved_by is None``). Events whose next step crosses no decision
+        place get ``(BOTTOM, {})``.
+
+        Outputs ``{case_id: [(p, z), ...]}`` with one entry per visible event,
+        index-aligned with :func:`extract_true_next_activities`.
+        """
+        df = self._prepare_df(event_log_df)
+        case_col = "case:concept:name"
+        decision_places = set(self.decision_places)
+        result: Dict[str, List[Tuple[str, Dict[str, float]]]] = {}
 
         for case_id, case_alignment in zip(sorted_case_ids, alignments):
             case = df[df[case_col] == case_id].reset_index(drop=True)
-            case_event_cursor = 0
-            past_events: List[Dict[str, Any]] = []
-            event_labels: List[Tuple[str, List[Dict[str, Any]], Dict[str, float], float]] = []
-            event_records: List[Dict[str, Any]] = []
+            sync_events = self._collect_sync_events(case, case_alignment)
+            n_events = len(sync_events)
 
-            for (log_name, model_name), (log_label, model_label) in case_alignment:
-                # log-only move
-                if model_name == ">>":
-                    continue  
+            records = replay_alignment_decisions(case_alignment,
+                                                 im=self.im,
+                                                 transition_by_name=self.transition_by_name,
+                                                 decision_places=decision_places)
+            # Proximate decision keyed on the event that resolves it. Bucket
+            # `n_events` collects the case-ending (EOS) decisions.
+            proximate: Dict[int, Any] = {}
+            for rec in records:
+                key = n_events if rec["resolved_by"] is None else int(rec["resolved_by"])
+                if key not in proximate or rec["order"] > proximate[key]["order"]:
+                    proximate[key] = rec
 
-                trans = self.transition_by_name.get(model_name)
-                if trans is None:
+            event_labels: List[Tuple[str, Dict[str, float]]] = []
+            for k in range(n_events):
+                rec = proximate.get(k + 1)      # decision resolved by e_{k+1}
+                if rec is None:
+                    event_labels.append((BOTTOM, {}))
                     continue
-
-                is_sync = (log_name != ">>") and (model_name != ">>")
-
-                if is_sync:
-                    # Match event in the log
-                    candidate_labels = [lbl for lbl in [log_label, model_label] if lbl]
-                    matched_event = None
-                    for pos in range(case_event_cursor, len(case)):
-                        if case.iloc[pos].get("concept:name", None) in candidate_labels:
-                            matched_event = case.iloc[pos]
-                            case_event_cursor = pos + 1
-                            break
-
-                    if matched_event is not None:
-                        ev_dict = matched_event.to_dict()
-                        event_attrs = self._filter_attributes(ev_dict)
-                    else:
-                        event_attrs = None
-
-                    # Update data state first: decision-aware labeling for a place in t• predicts the next event after e_i, so the feature state A_i includes e_i and all prior events.
-                    if event_attrs is not None:
-                        past_events.append(event_attrs)
-
-                    # Inspect t• for decision places.
-                    dps = self._places_after_transition(trans)
-                    if dps:
-                        dp = dps[0]
-                        dp_name = str(dp)
-                        z_i = self._predict_shallow(dp_name, past_events)
-                        c_i = max(z_i.values(), default=0.0)
-                        A_i = [dict(ev) for ev in past_events]
-                        event_labels.append((dp_name, A_i, z_i, c_i))
-                        event_records.append({"p_i": dp_name,
-                                              "A_i": A_i,
-                                              "z_i": dict(z_i),
-                                              "c_i": float(c_i)})
-                    else:
-                        A_i = [dict(ev) for ev in past_events]
-                        event_labels.append((BOTTOM, A_i, {}, 0.0))
-                        event_records.append({"p_i": BOTTOM,
-                                              "A_i": A_i,
-                                              "z_i": {},
-                                              "c_i": 0.0})
+                dp_name = str(rec["place"])
+                z = self._predict_shallow(dp_name, sync_events[:rec["sync_index"]])
+                event_labels.append((dp_name, z))
 
             result[case_id] = event_labels
-            self.last_offline_label_records[case_id] = event_records
 
         return result
+
+    def collect_decision_instances(self,
+                                   event_log_df: pd.DataFrame,
+                                   sorted_case_ids: List[str],
+                                   alignments: List[Any]
+                                   ) -> Tuple[List[List[Tuple[str, Dict[str, float]]]],
+                                              List[List[str]]]:
+        """
+        Per-decision-point evaluation instances, mirroring the miner's
+        ``collect_I`` exactly: one entry per decision-place firing.
+
+        Returns ``(decision_data, true_next)`` where, for each case,
+        ``decision_data[c][i] == (place_name, z)`` is the model's distribution
+        over the next activity at that firing and ``true_next[c][i]`` is the
+        replay-resolved target it was trained on. Because each firing is scored
+        against its *own* branch's target, concurrent branches do not
+        contaminate each other (unlike the per-visible-event view). Feed both
+        straight into :func:`compute_dp_diagnostics`.
+        """
+        df = self._prepare_df(event_log_df)
+        case_col = "case:concept:name"
+        decision_places = set(self.decision_places)
+
+        decision_data: List[List[Tuple[str, Dict[str, float]]]] = []
+        true_next: List[List[str]] = []
+
+        for case_id, case_alignment in zip(sorted_case_ids, alignments):
+            case = df[df[case_col] == case_id].reset_index(drop=True)
+            sync_events = self._collect_sync_events(case, case_alignment)
+            records = replay_alignment_decisions(case_alignment,
+                                                 im=self.im,
+                                                 transition_by_name=self.transition_by_name,
+                                                 decision_places=decision_places)
+            per_data: List[Tuple[str, Dict[str, float]]] = []
+            per_true: List[str] = []
+            for rec in records:
+                dp_name = str(rec["place"])
+                z = self._predict_shallow(dp_name, sync_events[:rec["sync_index"]])
+                per_data.append((dp_name, z))
+                per_true.append(rec["target"])
+            decision_data.append(per_data)
+            true_next.append(per_true)
+
+        return decision_data, true_next
 
     # Batch labeling for EventLogDataset
     def label_dataset_offline(self,
@@ -344,207 +440,131 @@ class DecisionLabeler:
                               sorted_case_ids: List[str],
                               alignments: List[Any]) -> None:
         """
-        Label all prefixes in an EventLogDataset using offline alignments.
+        Label all samples in an EventLogDataset using offline alignments.
+
+        Every active (non-padding) position of each sample receives a label,
+        which means both the encoder-side prefix and the decoder-side suffix
+        of teacher-forced suffix training are decision-labeled.
         """
         # 1) Label full traces
         trace_labels = self.label_traces_offline(event_log_df, sorted_case_ids, alignments)
 
-        # 2) Map to prefix rows in the dataset
-        n_samples = len(dataset)
-        decision_rows: List[List[Tuple[str, Dict[str, float], float]]] = []
+        # 2) Map to sample rows in the dataset. For each sample, walk every
+        # active position; non-EOS positions consume the next visible-event
+        # label of the trace, EOS / empty positions get BOTTOM.
+        decision_rows: List[List[Tuple[str, Dict[str, float]]]] = []
 
-        for idx in range(n_samples):
+        for idx in range(len(dataset)):
             case_id = dataset.case_ids[idx]
-            prefix_len = dataset._prefix_length_from_zero_mask(dataset.zero_padding[idx])
-            prefix_activities = dataset._extract_prefix_activity_labels(idx)
-
-            # Get the full trace labels for this case
+            active_len = dataset._prefix_length_from_zero_mask(dataset.zero_padding[idx])
+            active_activities = dataset._extract_prefix_activity_labels(idx)
             full_trace_labels = trace_labels.get(case_id, [])
 
-            # The prefix of length L corresponds to the first L visible events.
-            # We align by matching activity labels.
-            prefix_decision_labels: List[Tuple[str, Dict[str, float], float]] = []
+            sample_labels: List[Tuple[str, Dict[str, float]]] = []
             trace_cursor = 0
-            for pos in range(prefix_len):
-                act = prefix_activities[pos] if pos < len(prefix_activities) else ""
-                if act == "EOS" or act == "":
-                    prefix_decision_labels.append((BOTTOM, {}, 0.0))
+            for pos in range(active_len):
+                act = active_activities[pos] if pos < len(active_activities) else ""
+                if act in ("EOS", ""):
+                    sample_labels.append((BOTTOM, {}))
                     continue
-
-                # Find matching event in the trace labels
-                matched = False
-                while trace_cursor < len(full_trace_labels):
-                    trace_entry = full_trace_labels[trace_cursor]
-                    # The trace_labels list is in order of visible events,
-                    # so just advance the cursor
+                if trace_cursor < len(full_trace_labels):
+                    sample_labels.append(full_trace_labels[trace_cursor])
                     trace_cursor += 1
-                    if len(trace_entry) == 4:
-                        place_name, _, dist, c_i = trace_entry
-                        prefix_decision_labels.append((place_name, dist, c_i))
-                    else:
-                        prefix_decision_labels.append((BOTTOM, {}, 0.0))
-                    matched = True
-                    break
+                else:
+                    sample_labels.append((BOTTOM, {}))
 
-                if not matched:
-                    prefix_decision_labels.append((BOTTOM, {}, 0.0))
-
-            decision_rows.append(prefix_decision_labels)
+            decision_rows.append(sample_labels)
 
         dataset.set_decision_data(decision_rows)
 
-# Only for testing purpose
-# Decision-point diagnostics
-def compute_dp_diagnostics(decision_data: List[List[Tuple]],
-                           true_next_activities: List[List[str]],
-                           coverage_threshold: float = 0.0,
-                           n_calibration_bins: int = 10) -> Dict[str, Dict[str, float]]:
+
+def compute_dp_diagnostics(decision_data: List[List[Tuple[str, Dict[str, float]]]],
+                           true_next_activities: List[List[str]]) -> Dict[str, Dict[str, float]]:
     """
-    Compute per-decision-place quality diagnostics.
+    Per-decision-place accuracy of the trained decision model on held-out data.
 
-    Inputs:
-    - decision_data: One list per prefix, one entry per visible event (p_i, A_i, z_i, c_i)
-    - true_next_activities: Parallel structure to *decision_data*.  Each inner list contains the true activity label that *followed* the corresponding event in the prefix.  Use ``"EOS"`` for the last event and for padding positions.
-    - coverage_threshold: Minimum coverage required for a decision place to be included in the returned dict (0.0 = include all).
-    - n_calibration_bins: Number of equal-width bins used for Expected Calibration Error (ECE).
+    Inputs
+    ------
+    decision_data : list aligned with the dataset's case order. Each inner list
+        contains one ``(p_i, z_i)`` entry per visible event, as produced by
+        ``DecisionLabeler.label_traces_offline``.
+    true_next_activities : parallel structure to ``decision_data``. Each inner
+        list contains the activity that actually followed the corresponding
+        event, or ``"EOS"`` for the trace end.
 
-    Outputs:
-    - dict  {place_name: {metric_name: value}}
-    - Metrics per place:
-        - support: number of decision-labeled steps at this place
-        - entropy_mean : mean Shannon entropy H(z_i) in nats
-        - top1_accuracy : Pr(argmax z_i == true_label)
-        - top3_accuracy : Pr(true_label in top-3 of z_i)
-        - mean_true_prob : mean z_i(true_label)
-        - ece : Expected Calibration Error (confidence vs accuracy)
-        - coverage : Pr(true_label ∈ support(z_i))  support = {a: z_i(a)>0}
+    Returns
+    -------
+    ``{place_name: {support, top1_accuracy, top3_accuracy, mean_true_prob}}``.
     """
-    from collections import defaultdict
-    import math
+    from collections import defaultdict, Counter
 
-    # Accumulators keyed by place name
-    acc: Dict[str, Dict[str, list]] = defaultdict(lambda: {"entropy": [],
-                                                           "top1_correct": [],
-                                                           "top3_correct": [],
-                                                           "true_prob": [],
-                                                           "conf": [],          # for ECE: max(z_i)
-                                                           "in_support": [],    # for coverage
-                                                           })
+    acc: Dict[str, Dict[str, list]] = defaultdict(
+        lambda: {"top1": [], "top3": [], "true_prob": [], "true_acts": []})
 
     for prefix_labels, prefix_true in zip(decision_data, true_next_activities):
         for entry, true_act in zip(prefix_labels, prefix_true):
             if not isinstance(entry, tuple) or len(entry) < 2:
                 continue
-            place_name = entry[0]
-            # Supported tuple layouts:
-            # 1) (p_i, A_i, z_i, c_i)
-            # 2) (place_name, dist, c_i)
-            second = entry[1]
-            if isinstance(second, list) and len(entry) >= 3:
-                dist = entry[2]
-            else:
-                dist = second
-            if place_name == BOTTOM or not dist:
+            place_name, dist = entry[0], entry[1]
+            if place_name == BOTTOM or not dist or true_act in ("EOS", "", None):
                 continue
-            if true_act in ("EOS", "", None):
-                continue
+            ranked = sorted(dist.items(), key=lambda x: -x[1])
+            top1 = ranked[0][0]
+            top3 = {a for a, _ in ranked[:3]}
+            acc[place_name]["top1"].append(int(top1 == true_act))
+            acc[place_name]["top3"].append(int(true_act in top3))
+            acc[place_name]["true_prob"].append(float(dist.get(true_act, 0.0)))
+            acc[place_name]["true_acts"].append(true_act)
 
-            # Distribution metrics
-            probs = list(dist.values())
-            # Shannon entropy in nats
-            entropy = -sum(p * math.log(p + 1e-12) for p in probs if p > 0)
-
-            sorted_items = sorted(dist.items(), key=lambda x: -x[1])
-            top1_label = sorted_items[0][0] if sorted_items else ""
-            top3_labels = {itm[0] for itm in sorted_items[:3]}
-            true_prob = float(dist.get(true_act, 0.0))
-            conf = float(sorted_items[0][1]) if sorted_items else 0.0
-            in_support = true_act in dist and dist[true_act] > 0.0
-
-            acc[place_name]["entropy"].append(entropy)
-            acc[place_name]["top1_correct"].append(int(top1_label == true_act))
-            acc[place_name]["top3_correct"].append(int(true_act in top3_labels))
-            acc[place_name]["true_prob"].append(true_prob)
-            acc[place_name]["conf"].append(conf)
-            acc[place_name]["in_support"].append(int(in_support))
-
-    results: Dict[str, Dict[str, float]] = {}
-
-    for place_name, data in acc.items():
-        n = len(data["entropy"])
-        if n == 0:
+    # majority_baseline = relative frequency of the single most common realised
+    # next activity ("always predict the majority branch"); n_branches = number
+    # of distinct realised outcomes. A model is informative only if its top-1
+    # accuracy beats majority_baseline (and the place has >= 2 branches).
+    out: Dict[str, Dict[str, float]] = {}
+    for place, data in acc.items():
+        if not data["top1"]:
             continue
+        counts = Counter(data["true_acts"])
+        n = len(data["true_acts"])
+        out[place] = {"support": float(len(data["top1"])),
+                      "top1_accuracy": float(np.mean(data["top1"])),
+                      "top3_accuracy": float(np.mean(data["top3"])),
+                      "mean_true_prob": float(np.mean(data["true_prob"])),
+                      "majority_baseline": float(max(counts.values()) / n) if n else 0.0,
+                      "n_branches": int(len(counts))}
+    return out
 
-        coverage_val = float(np.mean(data["in_support"]))
-        if coverage_val < coverage_threshold:
-            continue
 
-        # ECE: bin by confidence, measure |acc - conf| per bin
-        confs = np.array(data["conf"])
-        corrects = np.array(data["top1_correct"], dtype=float)
-        bin_edges = np.linspace(0.0, 1.0, n_calibration_bins + 1)
-        ece = 0.0
-        for b in range(n_calibration_bins):
-            lo, hi = bin_edges[b], bin_edges[b + 1]
-            mask = (confs >= lo) & (confs < hi)
-            if b == n_calibration_bins - 1:
-                mask = (confs >= lo) & (confs <= hi)
-            if mask.sum() == 0:
-                continue
-            acc_bin = corrects[mask].mean()
-            conf_bin = confs[mask].mean()
-            ece += (mask.sum() / n) * abs(acc_bin - conf_bin)
-
-        results[place_name] = {"support": float(n),
-                               "entropy_mean": float(np.mean(data["entropy"])),
-                               "top1_accuracy": float(np.mean(data["top1_correct"])),
-                               "top3_accuracy": float(np.mean(data["top3_correct"])),
-                               "mean_true_prob": float(np.mean(data["true_prob"])),
-                               "ece": float(ece),
-                               "coverage": coverage_val}
-
-    return results
-
-# Only for testing purpose when decision miner is trained:
-def extract_true_next_activities(event_log_df: "pd.DataFrame",
-                                 sorted_case_ids: List[str],
-                                 alignments: List[Any]) -> List[List[str]]:
+def extract_true_next_activities(decision_data: List[List[Tuple[str, Dict[str, float]]]],
+                                 alignments: List[Any],
+                                 labeler: "DecisionLabeler") -> List[List[str]]:
     """
-    Build the per-prefix true-next-activity lists required by compute_dp_diagnostics.
+    Build the per-event true-next-activity lists required by
+    :func:`compute_dp_diagnostics`, index-aligned with
+    :func:`DecisionLabeler.label_traces_offline`.
 
-    For each case in sorted_case_ids we walk the alignment and collect the label of the next synchronous log move after each step,
-    mirroring the target label the decision model was trained to predict.
+    Entry ``k`` of a case is the activity that actually follows the ``k``-th
+    visible event, i.e. the ``(k+1)``-th visible activity of the trace, or
+    ``"EOS"`` for the last event. This is exactly the target the proximate
+    decision place at entry ``k`` was trained to predict.
     """
     result: List[List[str]] = []
-    for case_id, case_alignment in zip(sorted_case_ids, alignments):
-        n = len(case_alignment)
-        # Pre-compute first visible label at or AFTER each step (same logic as collect_I)
-        first_visible: List[Optional[str]] = [None] * n
-        future: Optional[str] = None
-        for i in range(n - 1, -1, -1):
-            (ln, mn), (ll, ml) = case_alignment[i]
-            if ln != ">>" and mn != ">>":
-                lbl = ll or ml
-                if lbl:
-                    future = lbl
-            first_visible[i] = future
+    for case_idx, case_alignment in enumerate(alignments):
+        per_case_labels = decision_data[case_idx] if case_idx < len(decision_data) else []
 
-        # Now compute next-visible (skip the current step's own label).
-        # We want: after step i fires, what is the next visible event?
-        # That equals first_visible[i+1] (or EOS if none).
+        # Visible activity labels in alignment order.
+        sync_labels: List[str] = []
+        for (log_name, model_name), (log_label, model_label) in case_alignment:
+            if log_name == ">>" or model_name == ">>":
+                continue
+            if labeler.transition_by_name.get(model_name) is None:
+                continue
+            sync_labels.append(log_label or model_label or "EOS")
+
+        n = len(per_case_labels)
         per_case: List[str] = []
-        for step_idx, ((log_name, model_name), _) in enumerate(case_alignment):
-            if model_name == ">>":
-                continue  # log-only move: no visible event from net
-            # Only emit an entry for visible (non-silent) transitions in the net
-            # that correspond to a synchronous move — same filter as collect_I
-            # uses when building I[p].
-            if log_name == ">>":
-                continue  # model-only (silent or skip) move: no event label
-            nva_idx = step_idx + 1
-            nva = first_visible[nva_idx] if nva_idx < n else None
-            per_case.append(nva if nva is not None else "EOS")
-
+        for k in range(n):
+            per_case.append(sync_labels[k + 1] if (k + 1) < len(sync_labels) else "EOS")
         result.append(per_case)
 
     return result
