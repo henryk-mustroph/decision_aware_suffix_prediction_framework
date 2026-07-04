@@ -10,3 +10,4 @@ __pycache__/
 
 # Notebook execution logs (e.g. papermill / nbconvert output)
 *.run.log
+.vscode/
