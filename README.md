@@ -8,35 +8,29 @@ Suffix prediction forecasts the remaining sequence of events of a running case u
 This repository implements decision-aware suffix prediction for business processes. Given a running case
 (a prefix of events), the models predict the remaining suffix. Decisions discovered from a data-aware Petri
 net are injected in two complementary ways: as a **semantic loss during training** and as **decision-rule-guided
-reasoning during decoding**. The whole workflow — data preparation, decision mining, model training and
-evaluation — is driven from a single per-dataset notebook and a shared `experiments` package.
+reasoning during decoding**. The whole workflow, data preparation, decision mining, model training and
+evaluation, is driven from a single per-dataset notebook and a shared `experiments` package.
 
 ## Repository layout
 
 ```
 src/
-  data_processing/      # event-log encoding, prefix building, decision labeling, Petri-net replay
-  decision_mining/      # alignment-based decision discovery + CatBoost guard estimators
-  simulator/            # generator for the synthetic Procurement event log
+  data_processing/           # event-log encoding, prefix building, decision labeling, Petri-net replay
+  decision_mining/           # alignment-based decision discovery + CatBoost guard estimators
+  simulator/                 # generator for the synthetic Procurement event log
   suffix_pred/
-    models/             # FS_LSTM, GAN_LSTM, K_UED_LSTM architectures
-    train.py            # trainers (CTraining, TTraining, UEDTrainer)
-    inference.py        # decoders (mode / probabilistic MCSA / beam)
-    decision_rule_guided_reasoning_inference.py   # guided decoding
-    evalaution/         # suffix decoding over the test set + evaluation metrics
-    experiments/        # orchestration: configs, data_loading, decision_mining, training, evaluation
+    models/                  # FS_LSTM, GAN_LSTM, K_UED_LSTM architectures
+    train.py                 # trainers (CTraining, TTraining, UEDTrainer)
+    inference.py             # decoders (mode / probabilistic MCSA / beam)
+    decision_rule_guided_reasoning_inference.py  # guided decoding
+    evalaution/              # suffix decoding over the test set + evaluation metrics
+    experiments/             # orchestration: configs, data_loading, decision_mining, training, evaluation
   notebooks/
-    pipeline_<Dataset>.ipynb   # one end-to-end pipeline per dataset
-    run_all_pipelines.ipynb    # runs every pipeline notebook sequentially
-    figure_dls_all_datasets.ipynb + paper_figures/   # paper figures
-
-data/          # generated tensors & Petri nets            (gitignored)
-models/        # trained checkpoints                        (gitignored)
-eval_results/  # cached decoding outputs & metrics          (gitignored)
+    pipeline_<Dataset>.ipynb # one end-to-end pipeline per dataset
+    run_all_pipelines.ipynb  # runs every pipeline notebook sequentially
 ```
 
-All output directories under `data/`, `models/` and `eval_results/` are created automatically by the
-pipeline — you do **not** need to pre-create them.
+All output directories `data/`, `models/` and `eval_results/` are created automatically by the pipeline.
 
 ## Setting up the Python environment with Pipenv
 
@@ -50,30 +44,19 @@ pipenv install     # create the virtual environment and install dependencies
 pipenv shell       # activate it
 ```
 
-Register the environment as a Jupyter kernel named `python3` (the batch runner expects this kernel):
+## Event logs
 
-```bash
-python -m ipykernel install --user --name python3
-```
+The real-world event logs are **not** in the repo. They are available from the original sources (see the references in the paper) and must be add to the repo. Check in the jupyters thhe pathd and change the `raw_root` in `experiments/configs.py` to point to the location.
 
-## Providing the raw event logs
 
-The real-world event logs are **not** redistributed with this repository. Each dataset expects a raw CSV at a
-location resolved by `experiments/configs.py` (`raw_root`, relative to `src/notebooks/`, plus the per-dataset
-`event_log_location`). By default `raw_root = "../../../../"`, so the logs are read from a shared store outside
-the repository — e.g. `<parent-of-repo-root>/data/data/`:
-
-| Dataset       | Expected raw file (`event_log_location`) |
+| Dataset       | Expected raw file                        |
 | ------------- | ---------------------------------------- |
-| `Helpdesk`    | `data/data/helpdesk.csv`                 |
-| `Sepsis`      | `data/data/Sepsis.csv`                   |
-| `Procurement` | `data/data/procurement_event_log.csv`    |
-| `BPIC20_DD`   | `data/data/DomesticDeclarations.csv`     |
+| `Helpdesk`    | `helpdesk.csv`                           |
+| `Sepsis`      | `Sepsis.csv`                             |
+| `Procurement` | `procurement_event_log.csv`              |
+| `BPIC20 DD`   | `DomesticDeclarations.csv`               |
 
-Place your logs at these paths, or edit `raw_root` / `event_log_location` in `experiments/configs.py` to point
-at your own location. The **Procurement** log is synthetic and can be regenerated with
-`src/simulator/artificial_procurement.py` (a generated copy is checked in at
-`src/simulator/procurement_event_log.csv`).
+The **Procurement** log is synthetic and can be regenerated with `src/simulator/artificial_procurement.py` (a generated copy is checked in at `src/simulator/procurement_event_log.csv`).
 
 ## Running the framework
 
@@ -99,8 +82,7 @@ The trained architectures (`MODELS`) and evaluation conditions (`Variant`) are:
 
 ### Run every dataset at once
 
-`src/notebooks/run_all_pipelines.ipynb` executes each pipeline notebook in an isolated subprocess via
-`nbconvert --execute --inplace`, writing per-notebook logs to `pipeline_<Dataset>.run.log` (gitignored).
+`src/notebooks/run_all_pipelines.ipynb` executes each pipeline notebook in an isolated subprocess.
 
 ## Configuration
 
