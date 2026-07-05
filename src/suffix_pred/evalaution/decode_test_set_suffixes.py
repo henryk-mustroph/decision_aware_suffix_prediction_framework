@@ -74,15 +74,9 @@ def _collect_probabilistic_case_chunk(case_ids: list[str]) -> list[dict]:
 
     return rows
 
-
-# Parallel deterministic worker helpers (module-level for pickling).
-# Covers the "mode" (arg-max) and "beam" decoders. We reuse each evaluator's
-# own ``evaluate`` by restricting its ``cases`` to the worker's chunk, so the
-# per-case decoding logic stays identical to the serial path.
 _DET_WORKER_DECODER = None
 _DET_WORKER_MODE = None
 _DET_WORKER_CASES = None
-
 
 def _init_deterministic_worker(model,
                                dataset,
@@ -179,8 +173,7 @@ class TestSetSuffixDecoder:
         - num_processes : int, optional: Number of worker processes.
 
         Outputs:
-        - list[dict]
-            - Each dict contains: case_id, prefix_len, prefix, target_suffix, decoded_suffixes, mode.
+        - list[dict]: Each dict contains: case_id, prefix_len, prefix, target_suffix, decoded_suffixes, mode.
         """
         if cache_path is not None and reuse_cache:
             try:

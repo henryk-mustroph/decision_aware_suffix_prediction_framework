@@ -1,15 +1,16 @@
 """
 Configuration registry for suffix-prediction experiments.
 Observed conventions (from the existing notebooks):
-  petri net    : data/{key}/Petri_net/{slug}.pkl
+
+- petri net    : data/{key}/Petri_net/{slug}.pkl
+
+- train/val    : data/{key}/tensor_data/{normal|decision_labeled}/{slug}_all_5_{train|val}.pkl
+- test         : data/{key}/tensor_data/normal/{slug}_all_5_test.pkl
   
-  train/val    : data/{key}/tensor_data/{normal|decision_labeled}/{slug}_all_5_{train|val}.pkl
-  test         : data/{key}/tensor_data/normal/{slug}_all_5_test.pkl
+- decision art : data/{key}/Petri_net/data_aware_Petri_net/{decision_places_bundle.json, models/, numeric_scalers.pkl}
   
-  decision art : data/{key}/Petri_net/data_aware_Petri_net/{decision_places_bundle.json, models/, numeric_scalers.pkl}
-  
-  model file   : models/{key}/{clean|decision}/{key}_{model_file}_v1_{clean|DA}.pkl
-  eval cache   : eval_results/{key}/{variant}/{slug}_{model_slug}_{tag}_outputs.pkl
+- model file   : models/{key}/{clean|decision}/{key}_{model_file}_v1_{clean|DA}.pkl
+- eval cache   : eval_results/{key}/{variant}/{slug}_{model_slug}_{tag}_outputs.pkl
 """
 from __future__ import annotations
 
@@ -61,7 +62,7 @@ class Variant(str, Enum):
         return self.model_source == "decision"
 
     
-# Ensure that model configs and and datasets configs are matching for correct training and decoding.
+# Ensure that model configs and datasets configs are matching for correct training and decoding.
 # All initialized alues are used for the evaluation in the paper
 # Model configs (Suffix pred): Intialization of default values and type
 @dataclass(frozen=True)

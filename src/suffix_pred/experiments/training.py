@@ -44,16 +44,7 @@ def _concept_info(dataset, concept_name: str) -> Tuple[int, int, int]:
 
 
 def _select_features(cfg: ExperimentConfig):
-    """
-    Look up this architecture's explicit input/output feature lists for the
-    current dataset and return (enc_feat, dec_feat, static_enc_feat, use_statics)
-    in the [categorical, numeric] form the models expect: the model inputs map to
-    enc_feat, the model outputs map to dec_feat. The concrete columns live in
-    ``DatasetConfig.model_features[model_key]`` (see configs.ModelFeatures).
-    UED uses all four (encoder-decoder + static path). FS (single LSTM) and GAN
-    (encoder-decoder generator) take only enc_feat and derive their activity
-    output size from it, so they ignore dec_feat / static_enc_feat.
-    """
+
     spec = cfg.dataset.model_features.get(cfg.model.key)
     if spec is None:
         raise KeyError(
@@ -101,7 +92,8 @@ def _warm_start_from_clean(model, cfg: ExperimentConfig, root) -> bool:
         return False
 
 def _resolve_lr_epochs(cfg: ExperimentConfig, model, root) -> tuple:
-    """Resolve (lr, epochs, warm_started) for this run.
+    """
+    Resolve (lr, epochs, warm_started) for this run.
 
     Clean variants use the ModelConfig base lr/epochs. Decision-aware variants,
     when warm-start is enabled and a clean checkpoint exists, load the clean

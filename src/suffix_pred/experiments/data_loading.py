@@ -41,7 +41,8 @@ def _strip_by_suffix(value):
     return s
 
 def _ensure_clean_log(ds: DatasetConfig, paths: DatasetPaths) -> None:
-    """Write the cleaned activity CSV expected at `event_log_location`.
+    """
+    Write the cleaned activity CSV expected at `event_log_location`.
 
     Always regenerated from the raw source when that source is present, so a
     pipeline run never silently reuses a stale cleaned log. Falls back to an

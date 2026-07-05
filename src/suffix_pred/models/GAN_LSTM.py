@@ -498,7 +498,9 @@ class TaymouriAdversarialLSTM(nn.Module):
                 "num_values": num_values}
 
     def init_weights_normal(self):
-        """Initialize G and D parameters (Algorithm 1, step 1: standard normal distribution)."""
+        """
+        Initialize G and D parameters (Algorithm 1, step 1: standard normal distribution).
+        """
         self.apply(init_weights)
 
 

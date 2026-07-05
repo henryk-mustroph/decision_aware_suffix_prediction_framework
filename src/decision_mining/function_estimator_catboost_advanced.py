@@ -2,17 +2,12 @@
 CatBoost base model + sklearn surrogate-tree estimator for one decision place.
 
 Two models are fitted on the same labels:
-  - base model (CatBoost) for highest-accuracy next-event prediction (used to
-    reweight the LSTM softmax at inference and to compute leaf probabilities)
-  - surrogate decision tree on one-hot-encoded categoricals (so rule strings
-    name the actual category levels and are readable as-is)
+- base model (CatBoost) for highest-accuracy next-event prediction (used to reweight the LSTM softmax at inference and to compute leaf probabilities)
+- surrogate decision tree on one-hot-encoded categoricals (so rule strings name the actual category levels and are readable as-is)
 
 Encoding:
-  - categorical features: native CatBoost handling for the base model;
-    one-hot dummies for the surrogate so leaf paths produce readable rules.
-  - continuous features: passed through unchanged. DecisionDiscovery is
-    expected to apply the same StandardScalers the LSTM uses *before* fitting,
-    so the surrogate's numeric thresholds live in the LSTM's runtime space.
+- categorical features: native CatBoost handling for the base model; one-hot dummies for the surrogate so leaf paths produce readable rules.
+- continuous features: passed through unchanged. DecisionDiscovery is expected to apply the same StandardScalers the LSTM uses *before* fitting, so the surrogate's numeric thresholds live in the LSTM's runtime space.
 """
 from __future__ import annotations
 
@@ -192,8 +187,7 @@ class FunctionEstimator:
         self._train_y_int: Optional[np.ndarray] = None
         self._train_base_proba: Optional[np.ndarray] = None
 
-    # -------- artifact serialization --------
-
+    # artifact serialization
     def to_artifact(self) -> Dict[str, Any]:
         return {"artifact_type": "decision_mining_estimator",
                 "artifact_version": 2,
@@ -218,12 +212,14 @@ class FunctionEstimator:
         state = dict(artifact.get("state", {}))
         cfg_dict = state.pop("cfg", None) or {}
         encoder_dict = state.pop("encoder", None)
+        
         # Drop unknown keys (e.g. from a previous artifact_version) - rely on
         # `setattr` for forward-compatible ones.
         known = {"label_encoder", "class_int_to_label", "base_model",
                  "surrogate_tree", "_cb_cat_cols", "base_raw_feature_names",
                  "feature_names", "_priors", "_train_X_enc", "_train_y_int",
                  "_train_base_proba"}
+        
         # Filter ModelConfig kwargs to the current dataclass field set.
         cfg_fields = {f for f in ModelConfig.__dataclass_fields__}
         cfg_dict = {k: v for k, v in cfg_dict.items() if k in cfg_fields}
@@ -231,10 +227,7 @@ class FunctionEstimator:
         if encoder_dict is not None:
             enc_fields = {f for f in FeatureEncoder.__dataclass_fields__}
             encoder_dict = {k: v for k, v in encoder_dict.items() if k in enc_fields}
-            # Backward-compat: artifacts written before `categorical_columns`
-            # became a field don't carry it. A categorical raw column `c` was
-            # expanded into `c{sep}<value>` dummy columns, whereas numeric
-            # columns keep their bare name -> recover the list from the dummies.
+
             if "categorical_columns" not in encoder_dict:
                 sep = encoder_dict.get("prefix_sep", "=")
                 raw = encoder_dict.get("raw_columns") or []
@@ -248,8 +241,7 @@ class FunctionEstimator:
                 setattr(obj, k, v)
         return obj
 
-    # -------- fit / predict --------
-
+    # fit / predict
     @classmethod
     def fit_from_xy(cls, X_raw: pd.DataFrame, y: List[str],
                     model_cfg: Optional[ModelConfig] = None,
@@ -402,8 +394,7 @@ class FunctionEstimator:
         labels = [self.class_int_to_label.get(int(c), str(c)) for c in class_ints]
         return labels, np.asarray(proba, dtype=float)
 
-    # -------- guard extraction --------
-
+    # guard extraction
     def extract_guards(self) -> Dict[str, List[Dict[str, Any]]]:
         """
         Walk the surrogate tree and emit one guard per (label, leaf) above the
@@ -503,10 +494,6 @@ class FunctionEstimator:
                         else:
                             iv["high"] = thresh if iv["high"] is None else min(float(iv["high"]), thresh)
 
-                # Only emit a base when its include / exclude set is non-empty.
-                # An empty `categorical_allowed[base] = []` would make the runtime
-                # matcher reject every value (str(val) not in set() == True), so
-                # exclude-only paths must NOT leave an empty allowed list behind.
                 cat_allowed = {b: sorted(set(ie["include"])) for b, ie in cat_inc_exc.items() if ie.get("include")}
                 cat_excluded = {b: sorted(set(ie["exclude"])) for b, ie in cat_inc_exc.items() if ie.get("exclude")}
                 rule_str = _simplify_rule(intervals, cat_allowed, cat_excluded)
@@ -562,10 +549,7 @@ class FunctionEstimator:
                     pm = float(stats["prob_model"][c_int])
                     prior = float(self._priors.get(int(c_int), 1e-12))
                     lift = pm / max(prior, 1e-12)
-                    # Require BOTH conditions: the leaf truly prefers this label,
-                    # and prefers it more than the prior does. This filters out
-                    # weak "matched but unlikely" rules that depress trust in
-                    # the explanation.
+
                     if pm >= float(self.cfg.min_leaf_prob) and lift >= float(self.cfg.min_leaf_lift):
                         out[lab].append({"rule": rule_str,
                                          "support": support,

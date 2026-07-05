@@ -1,13 +1,10 @@
-from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-import warnings
 
 import numpy as np
 import pandas as pd
 import sklearn
 import sklearn.preprocessing
 import torch
-from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.impute import SimpleImputer
 from torch.utils.data import Dataset
 from tqdm.notebook import tqdm
@@ -15,13 +12,9 @@ from tqdm.notebook import tqdm
 from data_processing.decision_labeling import DecisionLabeler
 
 def _categorical_token(value: object) -> object:
-    """Normalize categorical values.
-
+    """
+    Normalize categorical values.
     Goal: keep integer-coded categories stable (e.g. 1, 1.0 -> "1") so they
-    don't end up as float-looking categories ("1.0").
-
-    We keep tokens as `object` (typically strings) to avoid mixed-type sorting
-    issues inside sklearn encoders.
     """
     if pd.isna(value):
         return value
@@ -43,8 +36,8 @@ def _normalize_categorical_series(series: pd.Series) -> pd.Series:
     return series.map(_categorical_token).astype(object)
 
 def _ensure_group_key_column(df: pd.DataFrame, key: str) -> pd.DataFrame:
-    """Ensure `key` exists as a DataFrame column.
-
+    """
+    Ensure `key` exists as a DataFrame column.
     Pandas groupby/apply pipelines may move the grouping key into the index.
     Most of this codebase expects `key` to be a normal column.
     """
@@ -59,10 +52,10 @@ def _ensure_group_key_column(df: pd.DataFrame, key: str) -> pd.DataFrame:
 
     return df
 
-def _groupby_apply_preserve_key(
-    df: pd.DataFrame, key: str, func, *, sort: bool = False
-) -> pd.DataFrame:
-    """Run `df.groupby(key).apply(func)` and keep `key` as a column."""
+def _groupby_apply_preserve_key(df: pd.DataFrame, key: str, func, *, sort: bool = False) -> pd.DataFrame:
+    """
+    Run `df.groupby(key).apply(func)` and keep `key` as a column.
+    """
     df = _ensure_group_key_column(df, key)
     applied = df.groupby(key, sort=sort).apply(func)
 
@@ -95,8 +88,8 @@ class RawDataFrameLoader:
         seconds_in_day_column: str | None = None,
         date_format: str = "%Y-%m-%d %H:%M:%S.%f",
         min_suffix_size: int = 1,
-        **kwargs,
-    ):
+        **kwargs):
+        
         """
         Initialize the raw data frame loader.
         """
@@ -199,8 +192,8 @@ class CSV2EventLog(RawDataFrameLoader):
             self.df,
             self.case_name,
             lambda group: self.__add_last_rows(group),
-            sort=False,
-        )
+            sort=False)
+        
         self.df = applied.reset_index(drop=True)
 
         # Normalize categorical columns (dynamic + static) so integer-coded
@@ -1140,8 +1133,8 @@ class EventLogDataset(Dataset):
         tensor_bundle: dict[str, object],
         all_categories: tuple[list[tuple[str, int, dict[str, int]]]],
         all_static_categories: tuple[list[tuple[str, int, dict[str, int]]]],
-        encoder_decoder: TensorEncoderDecoder,
-    ):
+        encoder_decoder: TensorEncoderDecoder):
+        
         """
         Initialize the EventLogDataset with tensor data and encoding information.
         """
@@ -1214,24 +1207,16 @@ class EventLogDataset(Dataset):
 
     def prepare_guard_tensors(self, concept_name_feature_idx: int) -> None:
         """
-        Convert the sparse ``decision_data`` (list of ``(p_i, z_i)`` per
-        active event) into dense guard tensors that are stored on the
-        dataset and consumed by the decision-aware loss.
+        Convert the sparse ``decision_data`` (list of ``(p_i, z_i)`` per active event) into dense guard tensors that are stored on the dataset and consumed by the decision-aware loss.
 
         Must be called after :meth:`set_decision_data`.
 
         Creates:
-        - ``_guard_targets`` [N, T, num_classes]
-              Soft next-activity distributions z_i, right-aligned within the
-              padded length T. Rows where p_i = BOTTOM stay all-zero.
-        - ``_guard_mask`` [N, T]
-              1.0 at positions whose event has a decision label, 0.0 otherwise.
-              The loss only regularizes positions where the mask is 1.
+        - _guard_targets [N, T, num_classes]: Soft next-activity distributions z_i, right-aligned within the padded length T. Rows where p_i = BOTTOM stay all-zero.
+        - ``_guard_mask`` [N, T]: 1.0 at positions whose event has a decision label, 0.0 otherwise. The loss only regularizes positions where the mask is 1.
 
         Args:
-        - concept_name_feature_idx: index of the concept:name feature inside
-          all_categories[0]; used to map z_i's activity labels back to the
-          model's vocabulary indices.
+        - concept_name_feature_idx: index of the concept:name feature inside all_categories[0]; used to map z_i's activity labels back to the model's vocabulary indices.
         """
         if isinstance(self.decision_data, torch.Tensor):
             return  # decision data not set yet
@@ -1326,8 +1311,8 @@ class EventLogDataset(Dataset):
             new_tensor_bundle,
             self.all_categories,
             self.all_static_categories,
-            self.encoder_decoder,
-        )
+            self.encoder_decoder)
+        
         if isinstance(self.decision_data, torch.Tensor):
             new_ds.decision_data = self.decision_data.index_select(0, idx_tensor)
         else:
@@ -1337,9 +1322,7 @@ class EventLogDataset(Dataset):
             new_ds._guard_mask = self._guard_mask.index_select(0, idx_tensor)
         return new_ds
 
-    def set_decision_data(
-        self, decision_data, indices: Optional[Iterable[int]] = None
-    ) -> None:
+    def set_decision_data(self, decision_data, indices: Optional[Iterable[int]] = None) -> None:
         """
         Set decision-aware event labels for the dataset.
 
@@ -1408,8 +1391,8 @@ class EventLogLoader:
         self,
         event_log_location,
         event_log_properties,
-        prefix_df: PrefixesDataFrameLoader = None,
-    ):
+        prefix_df: PrefixesDataFrameLoader = None):
+        
         """
         Initialize the EventLogLoader.
 
@@ -1486,7 +1469,7 @@ class EventLogLoader:
         """
         Apply decision-aware offline labeling to a dataset in-place.
 
-        Inputs:
+        Args:
         - dataset : EventLogDataset: The dataset to label (modified in-place via set_decision_data).
         - petri_net : tuple: (net, initial_marking, final_marking).
         - decision_model_dir : str: Directory with per-place ``.pkl`` estimator files.

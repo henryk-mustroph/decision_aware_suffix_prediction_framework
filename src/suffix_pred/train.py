@@ -1,8 +1,8 @@
 """
 Trainers for the three suffix-prediction architectures:
 - UEDTrainer: dropout-uncertainty encoder-decoder LSTM (U-ED-LSTM)
-- CTraining:  Camargo-style next-event LSTM (C-LSTM)
-- TTraining:  Taymouri-style GAN encoder-decoder LSTM (T-GAN-LSTM)
+- CTraining:  Camargo-style next-event LSTM (FS-LSTM)
+- TTraining:  Taymouri-style GAN encoder-decoder LSTM (GAN-LSTM)
 
 Each trainer supports clean and decision-aware training. Decision-aware
 training adds a semantic set-membership loss (loss.Loss.semantic_loss)
@@ -58,9 +58,7 @@ class Trainer:
         # Decision-label denoising for the semantic loss: only constrain steps
         # whose ground-truth next activity is inside the decision model's
         # tau-support (i.e. the soft constraint agrees with the observed
-        # outcome). Default True; disable via optimize_values["sem_gate_gt_in_support"]
-        # to recover the exact Xu et al. (2018) formulation. See
-        # loss.Loss.semantic_loss for the rationale.
+        # outcome).
         self.sem_gate_gt_in_support = bool(optimize_values.get("sem_gate_gt_in_support", True))
 
         # Teacher forcing policy shared by autoregressive trainers.

@@ -39,6 +39,10 @@ class InductiveMiner:
                            case_ids: Optional[list] = None,
                            noise_threshold: float = 0):
         
+        """
+        use the pm4py inductive miner and set a noie threshold.
+        """
+        
         _, event_log = self._create_event_log(case_ids=case_ids)
         
         net, initial_marking, final_marking = pm4py.discover_petri_net_inductive(event_log,
@@ -60,7 +64,9 @@ class PNReplayMarkings:
         self.event_label = event_label
 
     def get_markings(self):
-        """Compute reached markings per prefix using transition lookup and PN semantics."""
+        """
+        Compute reached markings per prefix using transition lookup and PN semantics.
+        """
         prefix_event_labels = self.prefix_df[self.event_label].tolist()
         markings = []
 

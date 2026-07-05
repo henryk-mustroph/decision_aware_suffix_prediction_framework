@@ -2,20 +2,19 @@
 Alignment-driven decision mining for suffix prediction.
 
 Adapted from:
-  De Leoni & van der Aalst, "Data-aware process mining: discovering decisions
-  in processes using alignments", ACM SAC 2013.
+  De Leoni & van der Aalst, "Data-aware process mining: discovering decisions in processes using alignments", ACM SAC 2013.
 
 Per decision place, the miner fits two models on the same labels:
-  - a CatBoost base model that predicts the next visible event label, used at
-    inference to reweight the LSTM softmax.
-  - a sklearn decision-tree surrogate that yields human-readable guard rules.
+- a CatBoost base model that predicts the next visible event label, used at inference to reweight the LSTM softmax.
+- a sklearn decision-tree surrogate that yields human-readable guard rules.
 
 Feature layout (per training row):
   - static attributes:  one column per attribute (case-level constant value)
   - dynamic attributes: two columns per attribute
-      <attr>           value at the event just before the decision point
-      <attr>_past_avg  mean of even older events  (numeric attributes)
-      <attr>_past_mode most-frequent value across even older events (categorical)
+    - <attr>          : value at the event just before the decision point
+    - <attr>_past_avg : mean of even older events  (numeric attributes)
+    or
+    - <attr>_past_mode: most-frequent value across even older events (categorical)
 """
 from __future__ import annotations
 
@@ -29,51 +28,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from decision_mining.function_estimator_catboost_advanced import (
-    FunctionEstimator,
-    ModelConfig,
-)
-
+from decision_mining.function_estimator_catboost_advanced import (FunctionEstimator, ModelConfig)
 
 def replay_alignment_decisions(case_alignment: List[Any],
                                *,
                                im: Any,
                                transition_by_name: Dict[str, Any],
                                decision_places: set) -> List[Dict[str, Any]]:
-    """
-    Replay one optimal alignment as a token-flow firing sequence and resolve,
-    for every decision-place firing, the *next visible activity* it leads to.
-
-    The Petri nets produced by the Inductive Miner route most choices through
-    silent transitions (``skip_*``, ``init_loop_*``, ``tauSplit/Join``). The
-    paper's rule ``a* = x_i`` (label of the transition consuming from p) only
-    yields a usable next-activity target when that transition is visible; for a
-    silent routing transition it would collapse to EOS. We therefore follow the
-    *token* produced by the firing through subsequent silent transitions until
-    a synchronous (visible) move consumes a descendant of it, and use that
-    visible label as the target. Token *lineage* is tracked so that the two
-    concurrent branches created by a ``tauSplit`` do not contaminate each other:
-    a decision on one branch is only resolved by a visible event that actually
-    consumes a token descended from that decision.
-
-    For a synchronous decision firing the descendant is consumed at the same
-    step, so the target is simply that visible label (the paper's ``a* = x_i``).
-    A decision whose branch reaches the final marking with no further visible
-    event resolves to ``"EOS"`` (the paper's ``a* = EOS`` termination case).
-
-    Returns one record per decision-place firing::
-
-        {"place":       <pm4py place object>,
-         "sync_index":  <# synchronous events fired strictly before this firing>,
-         "target":      <next visible activity label, or "EOS">,
-         "resolved_by": <index of the visible event that resolved it, or None
-                         when the branch ends the case (target == "EOS")>,
-         "order":       <creation order within the trace>}
-
-    ``sync_index`` indexes the data state: the instance is conditioned on the
-    first ``sync_index`` synchronous events (the most recent one and the average
-    over the earlier ones, per the data-state definition).
-    """
+    
     # marking: place -> list of tokens; each token is the set of still-pending
     # decision ids whose target is "the next visible activity that consumes a
     # descendant of this token".
@@ -137,18 +99,15 @@ def replay_alignment_decisions(case_alignment: List[Any],
                         "order": int(did)})
     return records
 
-
 @dataclass
 class DecisionPointModel:
     place_name: str
     estimator: Any
 
-
 @dataclass
 class DecisionMiningResult:
     models: Dict[str, DecisionPointModel]
     skipped: List[str]
-
 
 def build_feature_row(attrs: Dict[str, Any],
                       *,
@@ -156,11 +115,6 @@ def build_feature_row(attrs: Dict[str, Any],
                       static_attributes: List[str]) -> Dict[str, Any]:
     """
     Build a single feature row from a sample's collected attributes.
-
-    Convention:
-      - ``attrs["past_events"]`` is a list of dicts of dynamic attribute
-        values, one per past event (chronological).
-      - All other keys in ``attrs`` are static (case-level constants).
     """
     attrs = dict(attrs) if attrs else {}
     past_events = attrs.pop("past_events", [])
@@ -191,18 +145,13 @@ def build_feature_row(attrs: Dict[str, Any],
     older_events = past_events[:-1]
 
     for key in sorted(allowed_dyn):
-        # Bare attribute name: value at the event immediately before the
-        # decision point. (Dynamic and static attribute names are disjoint, so
-        # this does not collide with the static columns above.)
         last_val = previous_event.get(key, np.nan)
         if isinstance(last_val, (int, np.integer)):
             last_val = str(int(last_val))
         features[key] = last_val
 
-        # One summary across even older events; choose by observed value type.
-        # When older_events is empty (decision at prefix length 1), fall back
-        # to the bare value so the column is always present and train /
-        # inference rows have the same schema.
+        # One summary across even older events.
+        # When older_events is empty (decision at prefix length 1), fall back to the bare value so the column is always present and train /inference rows have the same schema.
         seq = [ev.get(key, np.nan) for ev in older_events]
         valid = [v for v in seq
                  if v is not None and not (isinstance(v, (float, np.floating)) and np.isnan(v))]
@@ -236,15 +185,7 @@ class DecisionDiscovery:
                  event_log_df: pd.DataFrame,
                  alignments: List[Any],
                  numeric_scalers: Optional[Dict[str, Any]] = None) -> None:
-        """
-        Args
-        ----
-        numeric_scalers: optional ``{column_name: fitted scaler}`` mapping.
-            Applied to numeric columns of ``event_log_df`` (including the
-            computed elapsed-time columns) BEFORE feature collection so the
-            decision miner trains in the same space the LSTM sees at runtime.
-            Persisted by ``save_results`` and auto-loaded by ``DecisionLabeler``.
-        """
+
         self.net, self.im, self.fm = petri_net
         self.sorted_case_ids = sorted_case_ids
         self.event_log_df = event_log_df
@@ -311,8 +252,7 @@ class DecisionDiscovery:
                              case_alignment: List[Any],
                              dyn_keys: List[str]) -> List[Dict[str, Any]]:
         """
-        Ordered list of (filtered) attribute dicts, one per synchronous move of
-        the alignment, matched to the corresponding event row in ``case``.
+        Ordered list of (filtered) attribute dicts, one per synchronous move of the alignment, matched to the corresponding event row in ``case``.
         Index ``c`` of the returned list is the ``c``-th visible event.
         """
         sync_events: List[Dict[str, Any]] = []
@@ -339,12 +279,8 @@ class DecisionDiscovery:
         """
         For every decision place p, collect supervised samples ``(η, a*)``.
 
-        We replay each optimal alignment (:func:`replay_alignment_decisions`)
-        to obtain, for every firing that consumes a token from a decision place
-        p, the next visible activity ``a*`` reached on that branch (or ``EOS``)
-        together with the number of synchronous events that preceded it. The
-        data state ``η`` is then built from those preceding synchronous events
-        (the most recent one and the average over earlier ones).
+        We replay each optimal alignment (:func:`replay_alignment_decisions`) to obtain, for every firing that consumes a token from a decision place p, the next visible activity ``a*`` reached on that branch (or ``EOS``) together with the number of synchronous events that preceded it.
+        The data state ``η`` is then built from those preceding synchronous events (the most recent one and the average over earlier ones).
         """
         dyn_keys = list(dynamic_attributes or [])
         sta_keys = list(static_attributes or [])

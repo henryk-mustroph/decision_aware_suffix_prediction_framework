@@ -184,19 +184,6 @@ def average_dls(results_df: pd.DataFrame) -> float:
     return float(results_df["dls"].mean())
 
 
-# ---------------------------------------------------------------------------
-# Coherent / incoherent accuracy (Xu et al., 2018, Tables 4-5)
-#
-# DLS is an *incoherent*-style metric (per-token edit similarity). The semantic
-# loss is documented to slightly reduce incoherent accuracy while improving the
-# *coherent* / *constraint* metrics. These functions add the two missing
-# columns so the trade-off is observable:
-#   - exact_match : whole predicted suffix equals the target ("coherent").
-#   - token_acc   : positional token agreement ("incoherent"), denominator =
-#                   max(len) so length errors are penalised.
-# Sequences are scored exactly as DLS sees them (no extra EOS truncation), so
-# the columns line up case-for-case with the DLS DataFrame.
-# ---------------------------------------------------------------------------
 def exact_match_score(target_seq: list, predicted_seq: list) -> float:
     """1.0 iff the predicted activity suffix equals the target suffix."""
     return 1.0 if list(target_seq) == list(predicted_seq) else 0.0
@@ -252,17 +239,6 @@ def average_coherence(coherence_df: pd.DataFrame) -> dict:
             "token_acc": float(coherence_df["token_acc"].mean())}
 
 
-# ---------------------------------------------------------------------------
-# Decision-constraint conformance (Xu et al., 2018, "Constraint" column)
-#
-# The semantic loss optimises decision conformance, not DLS. This is the metric
-# that should move when decision-aware training works: the fraction of
-# decision-labeled decoder steps whose decoded activity lies in the tau-support
-#   S = { a | z(a) >= tau }
-# of the decision model. Per-step conflict bookkeeping is produced by the
-# decision-rule-guided evaluator (see experiments.evaluation.evaluate_conformance,
-# which runs it with guidance disabled so the decode stays the model's own).
-# ---------------------------------------------------------------------------
 def decision_conformance_rate(decision_steps: int, conflicts: int) -> float:
     """conformance = 1 - conflicts / decision_steps; NaN when no decision steps."""
     ds = int(decision_steps)

@@ -5,9 +5,9 @@ Suffix prediction forecasts the remaining sequence of events of a running case u
 
 ## Repository Summary
 
-This repository implements decision-aware suffix prediction for business processes: Given a running case (i.e., a prefix), the models predict the remaining suffix. Integrating decision mining allows for decision event labeling which makes decision-aware training and decision-aware decoding and reasoning possible. A decision labeled event, is an event that's coresponding transition in the discovered Petri net is followed by a place that has >1 outgoing transition. The decision labeled event additionally contains the decision models distribution for next events, and the the payload data values.
+This repository implements decision-aware suffix prediction for business processes: Given a running case (i.e., a prefix), the model predicts the remaining suffix. Integrating decision mining allows for decision event labeling which makes decision-aware training and decision-aware decoding and reasoning possible. A decision labeled event, is an event that's coresponding transition in the discovered Petri net is followed by a place that has >1 outgoing transition. The decision labeled event additionally contains the decision models distribution for next events, and the the payload data values.
 
-Decisions discovered from a data-aware Petri net are injected in two complementary ways: as a **semantic loss during training** and as **decision-rule-guided reasoning during decoding**. The whole workflow, data preparation, decision mining, model training and evaluation, is driven from a single per-dataset notebook and a shared `experiments` package.
+Decisions discovered from a data-aware Petri net are injected in two complementary ways: as a **semantic loss during training** and as **decision-rule-guided reasoning during decoding**.
 
 ## Repository layout
 
@@ -15,19 +15,21 @@ The input data folder `event_logs/` must be created by the user and the path in 
 
 ```
 src/
-  data_processing/           # event-log encoding, prefix building, decision labeling, Petri-net replay
-  decision_mining/           # alignment-based decision discovery + CatBoost guard estimators
-  simulator/                 # generator for the synthetic Procurement event log
+  data_processing/   # event-log encoding, prefix building, decision labeling, Petri-net replay
+  decision_mining/   # alignment-based decision discovery + CatBoost guard estimators
+  simulator/         # generator for the synthetic Procurement event log
+  
   suffix_pred/
-    models/                  # FS_LSTM, GAN_LSTM, K_UED_LSTM architectures
-    train.py                 # trainers (CTraining, TTraining, UEDTrainer)
-    inference.py             # decoders (mode / probabilistic MCSA / beam)
+    models/                                      # FS_LSTM, GAN_LSTM, K_UED_LSTM architectures
+    train.py                                     # trainers (CTraining, TTraining, UEDTrainer)
+    inference.py                                 # decoders (mode / probabilistic MCSA / beam)
     decision_rule_guided_reasoning_inference.py  # guided decoding
-    evalaution/              # suffix decoding over the test set + evaluation metrics
-    experiments/             # orchestration: configs, data_loading, decision_mining, training, evaluation
+    evalaution/                                  # suffix decoding over the test set + evaluation metrics
+    experiments/                                 # configs, data_loading, decision_mining,training, evaluation
+  
   notebooks/
-    pipeline_<Dataset>.ipynb # one end-to-end pipeline per dataset
-    run_all_pipelines.ipynb  # runs every pipeline notebook sequentially
+    pipeline_<Dataset>.ipynb  # one end-to-end pipeline per dataset
+    run_all_pipelines.ipynb   # runs every pipeline notebook sequentially
 ```
 
 All output directories `data/`, `models/` and `eval_results/` are created automatically by the pipeline.
@@ -61,16 +63,12 @@ The **Procurement** log is synthetic and can be regenerated with `src/simulator/
 
 `src/suffix_pred/experiments/configs.py` is the main file for the experiment configurations, it allows to make changes on all models, settings and datasets (e.g., hyperparameters, case-level and event-level attributes).
 
-is the single source of truth for every per-(dataset, model, variant)
-difference: attribute lists, concept names, hyperparameters and all path conventions. Paths for tensors,
-checkpoints and eval caches are derived there by convention, so adding a dataset or model means editing that
-file only.
-
 ## Running the framework
 
 Each dataset has a pipeline notebook in `src/notebooks/`
 (`pipeline_Helpdesk.ipynb`, `pipeline_Sepsis.ipynb`, `pipeline_Procurement.ipynb`, `pipeline_BPIC20_DD.ipynb`).
-Run the notebooks **from the `src/notebooks/` directory** — the first cell adds `../` to `sys.path` so that
+
+Run the notebooks **from the `src/notebooks/` directory** : The first cell adds `../` to `sys.path` so that
 `import suffix_pred.experiments` resolves.
 
 Every pipeline runs five stages:
@@ -88,6 +86,6 @@ The trained architectures (`MODELS`) and evaluation conditions (`Variant`) are:
 - **Variants:** `clean` (baseline), `decision_train` (semantic-loss training), `decision_decoding`
   (decision-rule-guided decoding of the clean model), `decision_train_decode` (both).
 
-Run every dataset at once
+### Run every dataset at once
 
 `src/notebooks/run_all_pipelines.ipynb` executes each pipeline notebook in an isolated subprocess.

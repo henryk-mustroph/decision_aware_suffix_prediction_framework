@@ -1,6 +1,5 @@
 """
 Loss functions for categorical event label sequence training.
-
 Includes standard and uncertainty-attenuated cross entropy variants, and a decision-aware semantic loss (set-membership constraint over the support of a decision-model distribution).
 """
 
@@ -143,19 +142,7 @@ class Loss:
                       gt_in_support_only=False):
         """
         Decision-aware semantic loss (L_sem).
-        Hard set-membership constraint at each decision-labeled event: the
-        predictor must place sufficient probability mass on the tau-support
-        of the decision-model distribution:
-            S^(i)_{k+s} := { a in A | z^(i)_{k+s}(a) >= tau }.
-
-        Per-step loss:
-            l_sem(i, s) = 1[p != bot] * 1[S != empty]
-                          * ( - log sum_{a in S} p_theta(a) )
-
-        Aggregated over a mini-batch:
-            L_sem = (1 / N_B) * sum_{i in B} sum_{s=0}^{S^(i)-1} l_sem(i, s)
-        where N_B is the count of decoder steps satisfying both indicators.
-
+        
         Inputs:
         - pred_logits: Predicted next-event logits: dim seq_len x batch x classes.
         - guard_targets: Soft decision-model distributions z_i: dim batch x seq_len x classes.
@@ -167,18 +154,7 @@ class Loss:
           Only consulted when ``gt_in_support_only`` is True.
         - gt_in_support_only: When True (and ``gt_targets`` is given), additionally
           restrict the loss to steps whose ground-truth next activity is itself in
-          the tau-support, i.e. steps where the (learned, imperfect) decision model
-          AGREES with the observed outcome. The semantic-loss formulation of
-          Xu et al. (2018) assumes *exact* logical constraints that the true label
-          always satisfies; a mined decision model is a *soft, noisy* constraint
-          whose tau-support excludes the realised next activity on a large fraction
-          of events (≈56% on Helpdesk). On those steps the unfiltered loss pulls
-          probability mass away from the ground truth and fights the base
-          cross-entropy, degrading suffix accuracy (DLS) while barely moving
-          decision conformance. This gate keeps the symbolic signal only where the
-          constraint is consistent with reality, which removes that label noise.
-          It uses the ground-truth label, so it is a *training-time* denoising
-          step only; inference-time decoding / conformance never see it (no leak).
+          the tau-support.
 
         Outputs:
         - L_sem: Scalar semantic loss averaged over N_B. Returns 0 (with grad) when no eligible step exists.

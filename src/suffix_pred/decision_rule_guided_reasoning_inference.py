@@ -23,24 +23,8 @@ from data_processing.decision_labeling import DecisionLabeler
 # use the inference modes implemented also in the standard case
 from .inference import Mode, Beam, MCSA
 
-# Display-only helpers. Notebooks import these to pretty-print cached reasoning
-# traces; the decoding loop itself does NOT call them, so they have no impact
-# on guard matching, conflict counts, or any persisted metric.
-
-# Past-summary suffixes added by `_build_feature_row`. We strip them to recover
-# the base column name so we can look up the corresponding scaler. The bare
-# attribute name (the value at the event right before the decision point) has
-# no suffix, so this regex matches only the summary columns.
-_LAG_SUFFIX_RE = re.compile(
-    r"(_past_avg|_past_mode)$"
-)
-
-# Matches "(feature <= 1.23e+06)" or "(feature > -0.4)" — but NOT
-# "(feature in {...})". Used to rewrite numeric thresholds in rule strings.
-_NUMERIC_COND_RE = re.compile(
-    r"\(([\w]+)\s*(<=|>)\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\)"
-)
-
+_LAG_SUFFIX_RE = re.compile(r"(_past_avg|_past_mode)$")
+_NUMERIC_COND_RE = re.compile(r"\(([\w]+)\s*(<=|>)\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\)")
 
 def _strip_lag_suffix(feature_full_name: str) -> str:
     return _LAG_SUFFIX_RE.sub("", str(feature_full_name))
@@ -78,11 +62,8 @@ def inverse_transform_for_display(feature_full_name: str,
 
 def format_duration_seconds(seconds: float) -> str:
     """
-    Render a seconds value as a human-readable duration. Small negatives -
-    which arise from float arithmetic on the mean of z-scaled times (first
-    events of a case have raw=0, z ~= -1.25, and averaging a handful of such
-    values can drift fractionally below the scaler's zero) - are clamped to
-    0 since negative elapsed times are physically impossible.
+    Render a seconds value as a human-readable duration. 
+    Small negatives, which arise from float arithmetic on the mean of z-scaled times (first events of a case have raw=0, z ~= -1.25, and averaging a handful of such values can drift fractionally below the scaler's zero), are clamped to 0 since negative elapsed times are physically impossible.
     """
     s = float(seconds)
     # Clamp tiny negatives that arise from float rounding of z-score
@@ -129,11 +110,10 @@ def format_value_for_display(feature_full_name: str,
                               numeric_scalers: Dict[str, Any]) -> str:
     """
     Render a feature value for a human-readable reasoning trace:
-      - categorical (str) values pass through unchanged
-      - numeric values are inverse-transformed via the registered scaler
-      - columns whose base name contains 'time' are rendered as durations
-      - any other continuous attribute is rendered with thousands grouping and
-        original-unit precision (see :func:`format_number_for_display`)
+    - categorical (str) values pass through unchanged
+    - numeric values are inverse-transformed via the registered scaler
+    - columns whose base name contains 'time' are rendered as durations
+    - any other continuous attribute is rendered with thousands grouping and original-unit precision (see :func:`format_number_for_display`)
     """
     if value is None:
         return "None"
@@ -151,9 +131,7 @@ def format_value_for_display(feature_full_name: str,
 def render_rule_for_display(rule_str: str,
                              numeric_scalers: Dict[str, Any]) -> str:
     """
-    Re-render a rule string so numeric thresholds are shown in original units
-    (and as durations for *_time features). Categorical 'X in {...}'
-    conditions pass through unchanged.
+    Re-render a rule string so numeric thresholds are shown in original units (and as durations for *_time features). Categorical 'X in {...}' conditions pass through unchanged.
     """
     if not rule_str:
         return rule_str
@@ -179,7 +157,6 @@ class DecisionGuidanceConfig:
     alpha: float = 0.1
     support_threshold: float = 0.05
 
-    # --- confidence / observability gating -------------------------------
     # Reweight a decision step ONLY when guidance is trustworthy. All three
     # gates default to no-ops so existing behaviour (always guide) is preserved
     # unless explicitly configured. See `_masked_distribution`.
@@ -483,7 +460,6 @@ class DecisionRuleGuidedMixin:
 
         cfg = self.guidance_config
 
-        # --- confidence / observability gating -------------------------------
         # Only steer when guidance is trustworthy; otherwise leave the model's
         # own distribution untouched (the step is still scored for conflicts /
         # explainability against z_i downstream, it is just not reweighted).
@@ -589,7 +565,8 @@ class DecisionRuleGuidedMixin:
 
     @staticmethod
     def _guard_has_conditions(guard: Dict[str, Any]) -> bool:
-        """True iff the guard carries at least one data-aware condition.
+        """
+        True iff the guard carries at least one data-aware condition.
 
         A guard with no intervals and no categorical allow/exclude sets is a
         vacuous ``(true)`` rule that explains nothing.

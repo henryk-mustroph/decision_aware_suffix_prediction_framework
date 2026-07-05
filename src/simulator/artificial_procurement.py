@@ -6,8 +6,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-# Configuration
-
 # The attribute values are chosen so that the decision-mining pipeline discovers human-readable guards that mix interval conditions (amount thresholds) and categorical conditions
 # (department, supplier_type, priority, …).  Every XOR split in the process is governed by a deterministic rule (+ light noise) that can be recovered by a surrogate decision tree.
 # created with the help of GenAI.

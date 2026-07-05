@@ -4,7 +4,6 @@ Decision-aware event labeling for suffix prediction.
 For each visible event in a trace we attach a pair ``(p_i, z_i)``:
 - p_i  -- the decision place reached by the event (sentinel ``BOTTOM`` if the event does not enable a decision place).
 - z_i  -- the decision model's probability distribution over the activities that can directly follow at p_i (empty when p_i == BOTTOM).
-
 """
 from __future__ import annotations
 
