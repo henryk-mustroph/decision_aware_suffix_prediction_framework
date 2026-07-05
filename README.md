@@ -5,9 +5,13 @@ Suffix prediction forecasts the remaining sequence of events of a running case u
 
 ## Repository Summary
 
-This repository implements decision-aware suffix prediction for business processes. Given a running case (a prefix of events), the models predict the remaining suffix. Decisions discovered from a data-aware Petri net are injected in two complementary ways: as a **semantic loss during training** and as **decision-rule-guided reasoning during decoding**. The whole workflow, data preparation, decision mining, model training and evaluation, is driven from a single per-dataset notebook and a shared `experiments` package.
+This repository implements decision-aware suffix prediction for business processes: Given a running case (i.e., a prefix), the models predict the remaining suffix. Integrating decision mining allows for decision event labeling which makes decision-aware training and decision-aware decoding and reasoning possible. A decision labeled event, is an event that's coresponding transition in the discovered Petri net is followed by a place that has >1 outgoing transition. The decision labeled event additionally contains the decision models distribution for next events, and the the payload data values.
+
+Decisions discovered from a data-aware Petri net are injected in two complementary ways: as a **semantic loss during training** and as **decision-rule-guided reasoning during decoding**. The whole workflow, data preparation, decision mining, model training and evaluation, is driven from a single per-dataset notebook and a shared `experiments` package.
 
 ## Repository layout
+
+The input data folder `event_logs/` must be created by the user and the path in the jupyters must be changed by the user.
 
 ```
 src/
@@ -42,8 +46,7 @@ pipenv shell       # activate it
 
 ## Event logs
 
-The real-world event logs are **not** in the repo. They are available from the original sources (see the references in the paper) and must be add to the repo. Check in the jupyters thhe pathd and change the `raw_root` in `experiments/configs.py` to point to the location.
-
+The real-world event logs are **not** in the repo. They are available from the original sources (see the references in the paper) and must be added to the repo. Check in the jupyters the paths and change the `raw_root` in `experiments/configs.py` to point to the location.
 
 | Dataset       | Expected raw file                        |
 | ------------- | ---------------------------------------- |

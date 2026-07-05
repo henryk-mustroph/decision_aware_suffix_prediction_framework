@@ -2,15 +2,9 @@
 Decision-aware event labeling for suffix prediction.
 
 For each visible event in a trace we attach a pair ``(p_i, z_i)``:
-    p_i  -- the decision place reached by the event (sentinel ``BOTTOM`` if
-            the event does not enable a decision place).
-    z_i  -- the decision model's probability distribution over the activities
-            that can directly follow at p_i (empty when p_i == BOTTOM).
+- p_i  -- the decision place reached by the event (sentinel ``BOTTOM`` if the event does not enable a decision place).
+- z_i  -- the decision model's probability distribution over the activities that can directly follow at p_i (empty when p_i == BOTTOM).
 
-Labeling is done offline from optimal alignments produced by the decision
-miner; the runtime online use of the same decision models during
-autoregressive decoding lives in
-``suffix_pred.decision_rule_guided_reasoning_inference``.
 """
 from __future__ import annotations
 
@@ -81,15 +75,10 @@ class DecisionLabeler:
                  static_attributes: Optional[List[str]] = None,
                  numeric_scalers: Optional[Dict[str, Any]] = None) -> None:
         """
-        numeric_scalers: optional mapping ``column_name -> fitted sklearn-style
-        transformer``. Applied to numeric columns of the event log during
-        offline labeling so the test-time feature space matches the one the
-        decision miner trained on (which itself matches the LSTM's scaled
-        runtime features). If not provided, the labeler attempts to load a
-        sibling ``numeric_scalers.pkl`` next to the bundle JSON; pass an
-        explicit empty dict to disable auto-loading.
+        numeric_scalers: optional mapping ``column_name -> fitted sklearn-style transformer``. 
+        Applied to numeric columns of the event log during offline labeling so the test-time feature space matches the one the decision miner trained on (which itself matches the LSTM's scaled
+        runtime features). If not provided, the labeler attempts to load a sibling ``numeric_scalers.pkl`` next to the bundle JSON; pass an explicit empty dict to disable auto-loading.
         """
-
 
         self.net, self.im, self.fm = petri_net
 
@@ -154,8 +143,8 @@ class DecisionLabeler:
 
     def _apply_numeric_scalers_to_df(self, df: pd.DataFrame) -> None:
         """
-        Transform numeric columns of ``df`` in-place with the persisted
-        scalers. Mirrors DecisionDiscovery._apply_numeric_scalers.
+        Transform numeric columns of ``df`` in-place with the persisted scalers.
+        Mirrors DecisionDiscovery._apply_numeric_scalers.
         """
         if not self.numeric_scalers:
             return
@@ -192,14 +181,11 @@ class DecisionLabeler:
         """
         Mirror of DecisionDiscovery.build_feature_row.
 
-        Static attributes pass through as single columns (latest non-null
-        observation). Each dynamic attribute emits two columns:
-          - ``<attr>``           value at the most recent observed event
-                                 (position j)
-          - ``<attr>_past_avg``  mean over all past events (including j)
-                                 for numeric attributes
-          - ``<attr>_past_mode`` most-frequent value across the same set
-                                 (categorical attributes)
+        Static attributes pass through as single columns (latest non-null observation). 
+        Each dynamic attribute emits two columns:
+        - ``<attr>``           value at the most recent observed event (position j)
+        - ``<attr>_past_avg``  mean over all past events (including j) for numeric attributes
+        - ``<attr>_past_mode`` most-frequent value across the same set (categorical attributes)
         """
         from collections import Counter
 
@@ -299,7 +285,9 @@ class DecisionLabeler:
     def _collect_sync_events(self,
                              case: pd.DataFrame,
                              case_alignment: List[Any]) -> List[Dict[str, Any]]:
-        """Ordered (filtered) attribute dicts, one per synchronous move."""
+        """
+        Ordered (filtered) attribute dicts, one per synchronous move.
+        """
         sync_events: List[Dict[str, Any]] = []
         cursor = 0
         for (log_name, model_name), (log_label, model_label) in case_alignment:
@@ -318,7 +306,9 @@ class DecisionLabeler:
         return sync_events
 
     def _prepare_df(self, event_log_df: pd.DataFrame) -> pd.DataFrame:
-        """Add elapsed-time columns and apply numeric scalers, as the miner did."""
+        """
+         Add elapsed-time columns and apply numeric scalers, as the miner did.
+         """
         df = event_log_df.copy()
         case_col = "case:concept:name"
         ts_col = "time:timestamp"
@@ -335,23 +325,15 @@ class DecisionLabeler:
                              sorted_case_ids: List[str],
                              alignments: List[Any]) -> Dict[str, List[Tuple[str, Dict[str, float]]]]:
         """
-        Per visible event, the decision place that governs the *next* visible
-        event together with the decision model's distribution over the next
-        activity label.
+        Per visible event, the decision place that governs the next visible event together with the decision model's distribution over the next event label.
 
-        We replay each alignment with :func:`replay_alignment_decisions` (the
-        exact routine the decision miner trained on). For the ``k``-th visible
-        event ``e_k`` we attach the decision whose branch is actually resolved
-        by the next event ``e_{k+1}`` (``resolved_by == k+1``); the proximate
-        such decision (created last) is used. This keys on the resolving event
-        rather than global event order, so a decision sitting on a *concurrent*
-        branch (resolved by a different event) is not mis-attached here. The
-        final event predicts ``EOS`` via a branch that ends the case
-        (``resolved_by is None``). Events whose next step crosses no decision
-        place get ``(BOTTOM, {})``.
+        We replay each alignment with :func:`replay_alignment_decisions`. 
+        For the ``k``-th visible event ``e_k`` we attach the decision whose branch is actually resolved by the next event ``e_{k+1}``.
+        The final event predicts ``EOS`` via a branch that ends the case (``resolved_by is None``). 
+        Events whose next step crosses no decision place get ``(BOTTOM, {})``.
 
-        Outputs ``{case_id: [(p, z), ...]}`` with one entry per visible event,
-        index-aligned with :func:`extract_true_next_activities`.
+        Returns:
+        - {case_id: [(p, z), ...]} with one entry per visible event, index-aligned with :func:`extract_true_next_activities`.
         """
         df = self._prepare_df(event_log_df)
         case_col = "case:concept:name"
@@ -392,20 +374,12 @@ class DecisionLabeler:
     def collect_decision_instances(self,
                                    event_log_df: pd.DataFrame,
                                    sorted_case_ids: List[str],
-                                   alignments: List[Any]
-                                   ) -> Tuple[List[List[Tuple[str, Dict[str, float]]]],
-                                              List[List[str]]]:
+                                   alignments: List[Any]) -> Tuple[List[List[Tuple[str, Dict[str, float]]]], List[List[str]]]:
         """
-        Per-decision-point evaluation instances, mirroring the miner's
-        ``collect_I`` exactly: one entry per decision-place firing.
+        Per-decision-point evaluation instances, mirroring the miner's ``collect_I`` exactly: one entry per decision-place firing.
 
-        Returns ``(decision_data, true_next)`` where, for each case,
-        ``decision_data[c][i] == (place_name, z)`` is the model's distribution
-        over the next activity at that firing and ``true_next[c][i]`` is the
-        replay-resolved target it was trained on. Because each firing is scored
-        against its *own* branch's target, concurrent branches do not
-        contaminate each other (unlike the per-visible-event view). Feed both
-        straight into :func:`compute_dp_diagnostics`.
+        Returns:
+        - (decision_data, true_next) where, for each case, ``decision_data[c][i] == (place_name, z)`` is the model's distribution over the next activity at that firing and ``true_next[c][i]`` is the replay-resolved target it was trained on.
         """
         df = self._prepare_df(event_log_df)
         case_col = "case:concept:name"
@@ -483,18 +457,13 @@ def compute_dp_diagnostics(decision_data: List[List[Tuple[str, Dict[str, float]]
     """
     Per-decision-place accuracy of the trained decision model on held-out data.
 
-    Inputs
-    ------
-    decision_data : list aligned with the dataset's case order. Each inner list
-        contains one ``(p_i, z_i)`` entry per visible event, as produced by
-        ``DecisionLabeler.label_traces_offline``.
-    true_next_activities : parallel structure to ``decision_data``. Each inner
-        list contains the activity that actually followed the corresponding
-        event, or ``"EOS"`` for the trace end.
+    Args:
+    - decision_data : list aligned with the dataset's case order. Each inner list contains one ``(p_i, z_i)`` entry per visible event, as produced by ``DecisionLabeler.label_traces_offline``.
+    - true_next_activities : parallel structure to ``decision_data``. 
+                             Each inner list contains the activity that actually followed the corresponding event, or ``"EOS"`` for the trace end.
 
     Returns
-    -------
-    ``{place_name: {support, top1_accuracy, top3_accuracy, mean_true_prob}}``.
+    - {place_name: {support, top1_accuracy, top3_accuracy, mean_true_prob}}.
     """
     from collections import defaultdict, Counter
 
@@ -516,10 +485,7 @@ def compute_dp_diagnostics(decision_data: List[List[Tuple[str, Dict[str, float]]
             acc[place_name]["true_prob"].append(float(dist.get(true_act, 0.0)))
             acc[place_name]["true_acts"].append(true_act)
 
-    # majority_baseline = relative frequency of the single most common realised
-    # next activity ("always predict the majority branch"); n_branches = number
-    # of distinct realised outcomes. A model is informative only if its top-1
-    # accuracy beats majority_baseline (and the place has >= 2 branches).
+    # majority_baseline = relative frequency of the single most common realised next activity ("always predict the majority branch")
     out: Dict[str, Dict[str, float]] = {}
     for place, data in acc.items():
         if not data["top1"]:
@@ -543,10 +509,8 @@ def extract_true_next_activities(decision_data: List[List[Tuple[str, Dict[str, f
     :func:`compute_dp_diagnostics`, index-aligned with
     :func:`DecisionLabeler.label_traces_offline`.
 
-    Entry ``k`` of a case is the activity that actually follows the ``k``-th
-    visible event, i.e. the ``(k+1)``-th visible activity of the trace, or
-    ``"EOS"`` for the last event. This is exactly the target the proximate
-    decision place at entry ``k`` was trained to predict.
+    Entry ``k`` of a case is the activity that actually follows the ``k``-th visible event, i.e. the ``(k+1)``-th visible activity of the trace, or ``"EOS"`` for the last event.
+    This is exactly the target the proximate decision place at entry ``k`` was trained to predict.
     """
     result: List[List[str]] = []
     for case_idx, case_alignment in enumerate(alignments):
