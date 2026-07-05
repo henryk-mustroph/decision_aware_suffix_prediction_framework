@@ -5,11 +5,7 @@ Suffix prediction forecasts the remaining sequence of events of a running case u
 
 ## Repository Summary
 
-This repository implements decision-aware suffix prediction for business processes. Given a running case
-(a prefix of events), the models predict the remaining suffix. Decisions discovered from a data-aware Petri
-net are injected in two complementary ways: as a **semantic loss during training** and as **decision-rule-guided
-reasoning during decoding**. The whole workflow, data preparation, decision mining, model training and
-evaluation, is driven from a single per-dataset notebook and a shared `experiments` package.
+This repository implements decision-aware suffix prediction for business processes. Given a running case (a prefix of events), the models predict the remaining suffix. Decisions discovered from a data-aware Petri net are injected in two complementary ways: as a **semantic loss during training** and as **decision-rule-guided reasoning during decoding**. The whole workflow, data preparation, decision mining, model training and evaluation, is driven from a single per-dataset notebook and a shared `experiments` package.
 
 ## Repository layout
 
@@ -58,14 +54,23 @@ The real-world event logs are **not** in the repo. They are available from the o
 
 The **Procurement** log is synthetic and can be regenerated with `src/simulator/artificial_procurement.py` (a generated copy is checked in at `src/simulator/procurement_event_log.csv`).
 
+## Configuration
+
+`src/suffix_pred/experiments/configs.py` is the main file for the experiment configurations, it allows to make changes on all models, settings and datasets (e.g., hyperparameters, case-level and event-level attributes).
+
+is the single source of truth for every per-(dataset, model, variant)
+difference: attribute lists, concept names, hyperparameters and all path conventions. Paths for tensors,
+checkpoints and eval caches are derived there by convention, so adding a dataset or model means editing that
+file only.
+
 ## Running the framework
 
-Each dataset has a self-contained pipeline notebook in `src/notebooks/`
+Each dataset has a pipeline notebook in `src/notebooks/`
 (`pipeline_Helpdesk.ipynb`, `pipeline_Sepsis.ipynb`, `pipeline_Procurement.ipynb`, `pipeline_BPIC20_DD.ipynb`).
 Run the notebooks **from the `src/notebooks/` directory** — the first cell adds `../` to `sys.path` so that
 `import suffix_pred.experiments` resolves.
 
-Every pipeline runs five stages, each toggled by a `RUN_*` switch in the first code cell:
+Every pipeline runs five stages:
 
 1. **`RUN_BASE`** — encode the raw log into "normal" tensor datasets and discover the Petri net.
 2. **`RUN_MINING`** — alignment-based decision discovery + per-place guard estimators.
@@ -75,18 +80,11 @@ Every pipeline runs five stages, each toggled by a `RUN_*` switch in the first c
 
 The trained architectures (`MODELS`) and evaluation conditions (`Variant`) are:
 
-- **Models:** `UED` (Dropout-Uncertainty Encoder-Decoder LSTM), `FS` (Full-Shared next-event LSTM),
-  `GAN` (Taymouri adversarial LSTM).
+- **Models:** `UED` (Uncertainty-Aware Encoder-Decoder LSTM), `FS` (Full-Shared LSTM),
+  `GAN` (Generative Adversarial Network LSTM).
 - **Variants:** `clean` (baseline), `decision_train` (semantic-loss training), `decision_decoding`
   (decision-rule-guided decoding of the clean model), `decision_train_decode` (both).
 
-### Run every dataset at once
+Run every dataset at once
 
 `src/notebooks/run_all_pipelines.ipynb` executes each pipeline notebook in an isolated subprocess.
-
-## Configuration
-
-`src/suffix_pred/experiments/configs.py` is the single source of truth for every per-(dataset, model, variant)
-difference: attribute lists, concept names, hyperparameters and all path conventions. Paths for tensors,
-checkpoints and eval caches are derived there by convention, so adding a dataset or model means editing that
-file only.
